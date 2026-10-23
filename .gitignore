@@ -12,6 +12,9 @@
 *.jsonl.gz
 *.pkl
 checkpoints/
+data/
+logs/
+models/
 checkpoints_hf/
 weight-sync/
 wandb/
@@ -19,7 +22,6 @@ outputs/
 output/
 run_logs/
 rollout-outputs/
-logs/
 *.log
 
 # 环境、缓存和构建产物
