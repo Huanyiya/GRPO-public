@@ -29,9 +29,10 @@ Invariants guaranteed by :func:`build_dp_schedule` (asserted by the tests):
     ``<= max_tokens_per_gpu * cp_size`` tokens, with one exception — an
     individual sample larger than that cap lands alone in its own mbs (and
     that mbs is the only one allowed to exceed the cap);
-  - the union of per-rank sample indices equals the set of samples kept
-    after trimming trailing rollouts (every kept sample placed exactly
-    once);
+  - the union of nonnegative per-rank sample indices equals the set of
+    samples kept after trimming trailing rollouts (every kept sample placed
+    exactly once); the optional partial-step mode keeps the tail and marks
+    zero-loss synchronization copies with negative indices;
   - flattening ``micro_batch_indices`` for a rank yields
     ``range(num_samples_rank)`` (each rank's samples are tiled exactly
     once by its mbs schedule).
@@ -99,15 +100,15 @@ def build_dp_schedule(
         total_lengths: token count per sample, indexed globally.
         global_batch_size: number of rollouts (NOT training samples) per
             training step. Number of training steps =
-            ``num_rollouts // global_batch_size``; trailing rollouts whose
-            samples don't fit are dropped.
+            ``num_rollouts // global_batch_size`` by default; trailing
+            rollouts are included when ``include_partial_train_step`` is set.
         rollout_indices: rollout id for each sample (``samples[i].index``).
             Samples sharing the same id are kept together in one step.
 
     Returns:
         ``(partitions, micro_batch_indices, num_microbatches, global_batch_sizes)``.
-        ``global_batch_sizes[s]`` = rollout count for step s (constant
-        ``global_batch_size`` for every step).
+        ``global_batch_sizes[s]`` = loss divisor for step s (constant
+        ``global_batch_size`` even for a partial step).
     """
     dp_size = train_parallel_config["dp_size"]
     cp_size = train_parallel_config["cp_size"]
@@ -132,7 +133,11 @@ def build_dp_schedule(
         rollout_id_to_samples.setdefault(rid, []).append(sample_pos)
     rollout_ids = list(rollout_id_to_samples.keys())
 
-    num_steps = len(rollout_ids) // global_batch_size
+    include_partial = getattr(args, "include_partial_train_step", False)
+    if include_partial and (args.use_dynamic_batch_size or args.micro_batch_size != 1):
+        raise ValueError("Partial training steps require static micro-batches of size 1")
+    num_steps = ((len(rollout_ids) + global_batch_size - 1) // global_batch_size
+                 if include_partial else len(rollout_ids) // global_batch_size)
     assert num_steps >= 1, (
         f"num_rollouts ({len(rollout_ids)}) < global_batch_size ({global_batch_size}); "
         f"need at least one rollout per step."
@@ -146,7 +151,13 @@ def build_dp_schedule(
     for step_i in range(num_steps):
         step_rollouts = rollout_ids[step_i * global_batch_size : (step_i + 1) * global_batch_size]
         sample_indices = [pos for rid in step_rollouts for pos in rollout_id_to_samples[rid]]
-        step_lengths = [total_lengths[i] for i in sample_indices]
+        # A partial step retains the full configured loss divisor, matching a
+        # fixed-size PPO minibatch. Negative indices denote zero-loss copies
+        # needed only to give all DP ranks the same number of micro-batches.
+        if include_partial and len(step_rollouts) < global_batch_size:
+            while len(sample_indices) < align_to or len(sample_indices) % align_to:
+                sample_indices.append(-sample_indices[0] - 1)
+        step_lengths = [total_lengths[i if i >= 0 else -i - 1] for i in sample_indices]
         global_batch_sizes.append(global_batch_size)
         assert len(sample_indices) >= dp_size, (
             f"step {step_i}: {len(sample_indices)} samples < dp_size {dp_size}; "

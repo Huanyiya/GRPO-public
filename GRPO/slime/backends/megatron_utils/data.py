@@ -273,7 +273,7 @@ def log_rollout_data(
         # ``Σsum / Σcount`` lands on ``sum_DP_full / num_rollouts`` — the
         # same number train_one_step reports for the same samples.
         dp_world = mpu.get_data_parallel_world_size(with_context_parallel=False)
-        num_rollouts_in_rollout = sum(rollout_data["global_batch_sizes"])
+        num_rollouts_in_rollout = rollout_data.get("num_valid_rollouts", sum(rollout_data["global_batch_sizes"]))
 
         # raw_reward is kept whole for pass@k; use only this rank's training
         # samples here so uneven DP partitions still produce the batch mean.
@@ -293,6 +293,7 @@ def log_rollout_data(
                 "rollout_top_p_token_offsets",
                 "rollout_routed_experts",
                 "global_batch_sizes",
+                "num_valid_rollouts",
                 "num_microbatches",
                 "micro_batch_indices",
                 "source_names",

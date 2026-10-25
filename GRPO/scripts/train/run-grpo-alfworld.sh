@@ -5,6 +5,8 @@
 
 set -euo pipefail
 unset PYTORCH_CUDA_ALLOC_CONF
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+NUM_GPUS=4
 
 MODEL_SIZE=${MODEL_SIZE:-2B}
 TASK_NAME=alfworld
@@ -22,8 +24,18 @@ INIT_CKPT=${GRPO_CLI_LAST_VALUE[--ref-load]:-${INIT_CKPT:-${MODEL_ROOT}/${MODEL_
 BASE_SAVE_DIR=${SAVE_DIR:-${CHECKPOINT_ROOT}/${TASK_NAME}/${MODEL_NAME}-GRPO}
 LOAD_DIR=${GRPO_CLI_LAST_VALUE[--load]:-${LOAD_DIR:-${BASE_SAVE_DIR}}}
 SAVE_DIR=${GRPO_CLI_LAST_VALUE[--save]:-${BASE_SAVE_DIR}}
+RESUME_ITERATION=19
+WANDB_RUN_ID=${WANDB_RUN_ID:-v938e9bt}
 WANDB_DIR=${GRPO_CLI_LAST_VALUE[--wandb-dir]:-${WANDB_DIR:-${LOG_ROOT}/${TASK_NAME}/${MODEL_NAME}/wandb}}
 UPDATE_WEIGHT_DISK_DIR=${UPDATE_WEIGHT_DISK_DIR:-${SAVE_DIR}/weight-sync}
+# Ray and SGLang create Unix sockets below their temporary directories.
+# Keep these short and on a local filesystem, as in the OPD launch scripts.
+DEFAULT_RAY_TMP_DIR=/dev/shm/ray-alfworld-$$
+RAY_TMP_DIR=${RAY_TMP_DIR:-${DEFAULT_RAY_TMP_DIR}}
+RAY_LOG_ARCHIVE_DIR=${RAY_LOG_ARCHIVE_DIR:-${LOG_ROOT}/ray}
+DEFAULT_WORKER_TMP_DIR=/dev/shm/alfworld-tmp-$$
+WORKER_TMP_DIR=${WORKER_TMP_DIR:-${DEFAULT_WORKER_TMP_DIR}}
+SGLANG_CONFIG_PATH=${WORKER_TMP_DIR}/sglang-text-only.yaml
 DATA_PATH=
 EVAL_DATA_PATH=
 
@@ -37,11 +49,18 @@ source "${MODEL_CONFIG}"
 export PYTHONUNBUFFERED=1 MASTER_ADDR MASTER_PORT
 export SGLANG_HEALTH_CHECK_TIMEOUT SGLANG_WARMUP_TIMEOUT
 export RAY_DISABLE_DASHBOARD_GPU_METRICS=1
+export RAY_TMP_DIR
+export TMPDIR="${WORKER_TMP_DIR}"
+export TMP="${TMPDIR}" TEMP="${TMPDIR}"
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY ftp_proxy FTP_PROXY NO_PROXY RAY_ADDRESS
 export no_proxy="localhost,127.0.0.1,0.0.0.0,${MASTER_ADDR}"
 export NO_PROXY="${no_proxy}"
 
 if [[ "${GRPO_DRY_RUN}" != true ]]; then
+  if [[ "$(cat "${LOAD_DIR}/latest_checkpointed_iteration.txt" 2>/dev/null || true)" != "${RESUME_ITERATION}" || ! -f "${LOAD_DIR}/iter_0000019/.metadata" || ! -f "${LOAD_DIR}/rollout/alfworld_data_source_19.pt" ]]; then
+    echo "Expected model iteration 19 and ALFWorld data state under ${LOAD_DIR}" >&2
+    exit 1
+  fi
   # Match the asset checks in SDA's prepare_alfworld.sh. The text environment
   # selects solvable game.tw-pddl files from the train split at runtime.
   for required_path in \
@@ -67,7 +86,19 @@ if [[ "${GRPO_DRY_RUN}" != true ]]; then
     fi
   done
   PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}" "${PYTHON_BIN}" -c 'import alfworld, textworld, yaml'
-  mkdir -p "${WANDB_DIR}"
+  mkdir -p "${WANDB_DIR}" "${RAY_TMP_DIR}" "${RAY_LOG_ARCHIVE_DIR}" "${WORKER_TMP_DIR}"
+  # ALFWorld uses text only. Skip SGLang's multimodal processor, whose Qwen
+  # module cannot import against the installed Transformers version.
+  cat > "${SGLANG_CONFIG_PATH}" <<EOF
+sglang:
+  - name: default
+    server_groups:
+      - worker_type: regular
+        num_gpus: ${NUM_GPUS}
+        num_gpus_per_engine: 1
+        overrides:
+          enable_multimodal: false
+EOF
 fi
 
 NVLINK_COUNT=0
@@ -136,6 +167,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
   --use-wandb
   --wandb-mode online
+  --wandb-run-id "${WANDB_RUN_ID}"
   --wandb-dir "${WANDB_DIR}"
   --wandb-project "GRPO-${TASK_NAME}-${MODEL_NAME}"
   --wandb-group "${TASK_NAME}-${MODEL_NAME}-nonthinking"
@@ -161,6 +193,7 @@ PERF_ARGS=(
 )
 
 SGLANG_ARGS=(
+  --sglang-config "${SGLANG_CONFIG_PATH}"
   --rollout-num-gpus-per-engine 1
   --sglang-context-length 2560
   --sglang-server-concurrency 64
@@ -208,13 +241,35 @@ fi
   --node-ip-address "${MASTER_ADDR}" \
   --port "${MASTER_PORT}" \
   --num-gpus "${NUM_GPUS}" \
+  --temp-dir "${RAY_TMP_DIR}" \
   --disable-usage-stats \
   --dashboard-host 0.0.0.0 \
   --dashboard-port "${RAY_DASHBOARD_PORT}"
 
+# Archive this run's Ray logs before removing its transient runtime files.
+archive_ray_logs() {
+  local exit_status=$?
+  trap - EXIT
+  local session_dir
+  session_dir=$(readlink -f -- "${RAY_TMP_DIR}/session_latest") || session_dir=
+  if [[ -n "${session_dir}" && -d "${session_dir}/logs" ]]; then
+    mkdir -p "${RAY_LOG_ARCHIVE_DIR}/$(basename -- "${session_dir}")"
+    cp -a -- "${session_dir}/logs" "${RAY_LOG_ARCHIVE_DIR}/$(basename -- "${session_dir}")/" || true
+  fi
+  "${RAY_BIN}" stop --force >/dev/null 2>&1 || true
+  if [[ "${RAY_TMP_DIR}" == "${DEFAULT_RAY_TMP_DIR}" ]]; then
+    rm -rf -- "${RAY_TMP_DIR}"
+  fi
+  if [[ "${WORKER_TMP_DIR}" == "${DEFAULT_WORKER_TMP_DIR}" ]]; then
+    rm -rf -- "${WORKER_TMP_DIR}"
+  fi
+  exit "${exit_status}"
+}
+trap archive_ray_logs EXIT
+
 RUNTIME_ENV_JSON=$(printf \
-  '{"env_vars":{"PYTHONPATH":"%s:%s","ALFWORLD_DATA":"%s","CUDA_DEVICE_MAX_CONNECTIONS":"1","NCCL_NVLS_ENABLE":"%s","GLOO_SOCKET_IFNAME":"%s","TP_SOCKET_IFNAME":"%s","MASTER_ADDR":"%s","MASTER_PORT":"%s","RAY_DISABLE_DASHBOARD_GPU_METRICS":"1","SLIME_RELOAD_PROCESS_GROUPS":"0","SGLANG_HEALTH_CHECK_TIMEOUT":"%s","SGLANG_WARMUP_TIMEOUT":"%s","no_proxy":"%s","NO_PROXY":"%s"}}' \
-  "${REPO_ROOT}" "${MEGATRON_PATH}" "${ALFWORLD_DATA}" "${HAS_NVLINK}" "${SOCKET_IFNAME}" "${SOCKET_IFNAME}" \
+  '{"env_vars":{"PYTHONPATH":"%s:%s","ALFWORLD_DATA":"%s","TMPDIR":"%s","TMP":"%s","TEMP":"%s","CUDA_DEVICE_MAX_CONNECTIONS":"1","NCCL_NVLS_ENABLE":"%s","GLOO_SOCKET_IFNAME":"%s","TP_SOCKET_IFNAME":"%s","MASTER_ADDR":"%s","MASTER_PORT":"%s","RAY_DISABLE_DASHBOARD_GPU_METRICS":"1","SLIME_RELOAD_PROCESS_GROUPS":"0","SGLANG_HEALTH_CHECK_TIMEOUT":"%s","SGLANG_WARMUP_TIMEOUT":"%s","no_proxy":"%s","NO_PROXY":"%s"}}' \
+  "${REPO_ROOT}" "${MEGATRON_PATH}" "${ALFWORLD_DATA}" "${WORKER_TMP_DIR}" "${WORKER_TMP_DIR}" "${WORKER_TMP_DIR}" "${HAS_NVLINK}" "${SOCKET_IFNAME}" "${SOCKET_IFNAME}" \
   "${MASTER_ADDR}" "${MASTER_PORT}" "${SGLANG_HEALTH_CHECK_TIMEOUT}" "${SGLANG_WARMUP_TIMEOUT}" "${no_proxy}" "${NO_PROXY}")
 
 "${RAY_BIN}" job submit \

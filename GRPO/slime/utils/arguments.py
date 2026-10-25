@@ -717,6 +717,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             # `rollout_batch_size * n_samples_per_prompt`.
             reset_arg(parser, "--global-batch-size", type=int, default=None)
             parser.add_argument(
+                "--include-partial-train-step", action="store_true", default=False,
+                help="Train on the final partial step, padding DP ranks with zero-loss copies while retaining the configured global batch loss divisor.",
+            )
+            parser.add_argument(
+                "--allow-multiple-rollout-ids-per-generation", action="store_true", default=False,
+                help="Allow a compact generation to emit independent loss units, such as one sample per environment turn.",
+            )
+            parser.add_argument(
                 "--num-steps-per-rollout",
                 type=int,
                 default=None,

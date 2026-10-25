@@ -873,7 +873,12 @@ def train(
             and mpu.get_tensor_model_parallel_rank() == 0
             and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
         ):
-            accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
+            if getattr(args, "include_partial_train_step", False):
+                # WebShop emits a variable number of turns per rollout. The
+                # persisted optimizer sample counter is the actual update count.
+                accumulated_step_id = int(opt_param_scheduler.num_steps // args.global_batch_size) - 1
+            else:
+                accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
             role = getattr(model[0], "role", "actor")
             role_tag = "" if role == "actor" else f"{role}-"
             log_dict = {}

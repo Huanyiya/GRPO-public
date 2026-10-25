@@ -704,11 +704,11 @@ class RolloutManager:
             data = data.samples
             # Enforce the rollout_id contract before flattening: any list[Sample]
             # encountered in the nested output must have rollout_id set on every
-            # element. Default rollouts inherit it from the data source; compact /
-            # subagent paths that split one rollout into N training samples must
-            # set the same rollout_id on every sibling so the loss reducer counts
-            # the rollout once instead of N times.
-            _validate_rollout_id_annotated(data)
+            # element. Compact rollouts normally share an id; environments that
+            # train each turn independently opt in to distinct ids.
+            _validate_rollout_id_annotated(
+                data, allow_multiple=getattr(self.args, "allow_multiple_rollout_ids_per_generation", False)
+            )
             # flatten the data if it is a list of lists
             while isinstance(data[0], list):
                 data = list(itertools.chain.from_iterable(data))
@@ -912,11 +912,8 @@ class RolloutManager:
         :func:`build_dp_schedule` so it stays unit-testable without Ray/sglang.
 
         Step split is by rollout id (``samples[i].rollout_id``, falling back
-        to ``samples[i].index``); each step holds exactly
-        ``args.global_batch_size`` rollouts so the training-step count per
-        rollout is fixed at ``rollout_batch_size * n_samples_per_prompt //
-        global_batch_size`` regardless of how many training samples each
-        rollout produced.
+        to ``samples[i].index``). Optional partial-step mode keeps the tail
+        and marks synchronization copies with negative partition indices.
         """
         dp_size = self.train_parallel_config["dp_size"]
         total_lengths = [len(t) for t in data["tokens"]]
@@ -956,13 +953,24 @@ class RolloutManager:
             ]:
                 if key not in data:
                     continue
-                rollout_data[key] = [data[key][j] for j in partition]
+                rollout_data[key] = [data[key][j if j >= 0 else -j - 1] for j in partition]
+            for local_pos, sample_pos in enumerate(partition):
+                if sample_pos >= 0:
+                    continue
+                # Padding is a forward/backward synchronization placeholder.
+                # Its sampled tokens and old log-probs are valid, while its
+                # loss and advantage must contribute exactly zero gradient.
+                rollout_data["loss_masks"][local_pos] = [0] * len(rollout_data["loss_masks"][local_pos])
+                rollout_data["rewards"][local_pos] = 0.0
+                rollout_data["truncated"][local_pos] = 0
             # keys that need to be splited at train side
             for key in ["raw_reward", "total_lengths"]:
                 if key not in data:
                     continue
                 rollout_data[key] = data[key]
             rollout_data["global_batch_sizes"] = global_batch_sizes
+            if getattr(self.args, "include_partial_train_step", False):
+                rollout_data["num_valid_rollouts"] = len(set(data["rollout_ids"]))
             rollout_data["num_microbatches"] = num_microbatches
             rollout_data["micro_batch_indices"] = micro_batch_indices[r]
             _tensorize_rollout_data_for_training(rollout_data)
@@ -976,7 +984,7 @@ class RolloutManager:
         return rollout_data_refs
 
 
-def _validate_rollout_id_annotated(node, depth=0):
+def _validate_rollout_id_annotated(node, depth=0, *, allow_multiple=False):
     """Walk the rollout function's nested output and validate ``rollout_id`` only
     when a compact / subagent pattern is detected.
 
@@ -987,8 +995,9 @@ def _validate_rollout_id_annotated(node, depth=0):
     preserving backward compatibility. A compact rollout adds a third level:
     ``list[list[list[Sample]]]`` (prompt × rollout × samples-from-one-rollout),
     so the leaf ``list[Sample]`` lands at depth ≥ 2. At that point we require
-    every sibling to carry a non-None ``rollout_id`` and to share the same
-    value, so the loss reducer counts the rollout once instead of N times.
+    every sibling to carry a non-None ``rollout_id`` and normally to share the
+    same value, so the loss reducer counts the rollout once instead of N times.
+    Some environments deliberately train each turn as its own loss unit.
     """
     if isinstance(node, Sample):
         return
@@ -1002,10 +1011,11 @@ def _validate_rollout_id_annotated(node, depth=0):
                 f"positions {missing}. Set Sample.rollout_id on every sibling so the loss "
                 "reducer can aggregate them as one rollout instead of N."
             )
-            assert len(set(rids)) == 1, f"Sibling samples from one compact rollout must share rollout_id; got {rids}."
+            if not allow_multiple:
+                assert len(set(rids)) == 1, f"Sibling samples from one compact rollout must share rollout_id; got {rids}."
         return
     for item in node:
-        _validate_rollout_id_annotated(item, depth + 1)
+        _validate_rollout_id_annotated(item, depth + 1, allow_multiple=allow_multiple)
 
 
 def _allocate_rollout_engine_addr_and_ports_normal(
