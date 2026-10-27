@@ -9,24 +9,20 @@
 set -euo pipefail
 unset PYTORCH_CUDA_ALLOC_CONF
 
+export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+export JVM_PATH="$JAVA_HOME/lib/server/libjvm.so"
+export PATH="$JAVA_HOME/bin:$PATH"
 MODEL_SIZE=${MODEL_SIZE:-2B}
 TASK_NAME=webshop
-NUM_GPUS=${NUM_GPUS:-4}
-PYTHON_BIN=${PYTHON_BIN:-$(command -v python3)}
-if [[ -z "${RAY_BIN:-}" ]]; then
-  if [[ -x "$(dirname -- "${PYTHON_BIN}")/ray" ]]; then
-    RAY_BIN="$(dirname -- "${PYTHON_BIN}")/ray"
-  else
-    RAY_BIN=$(command -v ray || true)
-  fi
-fi
+NUM_GPUS=${NUM_GPUS:-8}
+
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/common.sh"
 cd "${REPO_ROOT}"
 grpo_parse_cli "$@"
 
 GPU_IDS=${GPU_IDS:-$(seq -s, 0 "$((NUM_GPUS - 1))")}
 export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
-WEBSHOP_ROOT=$(realpath -m -- "${WEBSHOP_ROOT:-${PROJECT_ROOT}/webshop}")
+WEBSHOP_ROOT=$(realpath -m -- "${WEBSHOP_ROOT:-${REPO_ROOT}/webshop}")
 WEBSHOP_DATA=$(realpath -m -- "${WEBSHOP_DATA:-${DATA_ROOT}/webshop}")
 export WEBSHOP_ROOT WEBSHOP_DATA
 
@@ -152,16 +148,15 @@ OPTIMIZER_ARGS=(
   --adam-beta2 0.98
   --override-opt-param-scheduler
 )
-WANDB_ARGS=()
-if [[ "${USE_WANDB:-0}" == 1 ]]; then
-  WANDB_ARGS=(
+
+WANDB_ARGS=(
     --use-wandb
     --wandb-mode online
     --wandb-dir "${WANDB_DIR}"
     --wandb-project "GRPO-${TASK_NAME}-${MODEL_NAME}"
     --wandb-group "${TASK_NAME}-${MODEL_NAME}-nonthinking"
   )
-fi
+
 
 PERF_ARGS=(
   --log-grpo-step-timing
@@ -178,7 +173,7 @@ PERF_ARGS=(
   --recompute-num-layers 1
   --use-dynamic-batch-size
   --max-tokens-per-gpu 8192
-  --calculate-per-token-loss
+  --per-turn-loss
   --log-probs-chunk-size 1024
 )
 

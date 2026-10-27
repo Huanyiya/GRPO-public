@@ -919,12 +919,20 @@ class RolloutManager:
         total_lengths = [len(t) for t in data["tokens"]]
         data["total_lengths"] = total_lengths
 
+        # Count valid turns across the whole optimizer step before DP packing.
+        # Padding copies added by the scheduler are excluded automatically.
+        turn_validity = (
+            [sum(mask) > 0 for mask in data["loss_masks"]]
+            if getattr(self.args, "per_turn_loss", False) else None
+        )
+
         partitions, micro_batch_indices, num_microbatches, global_batch_sizes = build_dp_schedule(
             self.args,
             self.train_parallel_config,
             total_lengths,
             global_batch_size=self.args.global_batch_size,
             rollout_indices=data["rollout_ids"],
+            turn_validity=turn_validity,
         )
 
         # Package per-rank rollout_data
@@ -1403,6 +1411,14 @@ def compute_metrics_from_samples(args, samples):
     response_lengths = [sample.effective_response_length for sample in samples]
 
     log_dict = {}
+    # WebShop emits one sample per action. Count each episode once so longer
+    # episodes do not have more weight in the training batch accuracy.
+    episode_outcomes = {}
+    for sample in samples:
+        if sample.metadata and "episode_won" in sample.metadata:
+            episode_outcomes[sample.rollout_id] = bool(sample.metadata["episode_won"])
+    if episode_outcomes:
+        log_dict["accuracy"] = sum(episode_outcomes.values()) / len(episode_outcomes)
     log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
     log_dict |= _compute_zero_std_metrics(args, samples)
     log_dict |= _compute_spec_metrics(args, samples)

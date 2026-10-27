@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Convert the ALFWorld Qwen3.5-2B GRPO torch_dist checkpoint to Hugging Face.
+# Convert every ALFWorld Qwen3.5-2B GRPO torch_dist checkpoint to Hugging Face.
 
 set -euo pipefail
 
@@ -7,23 +7,18 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 PROJECT_ROOT="$(cd -- "${REPO_ROOT}/.." && pwd)"
 
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-${PROJECT_ROOT}/checkpoints/alfworld/Qwen3.5-2B-GRPO/iter_0000099}"
+CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-${PROJECT_ROOT}/checkpoints/webshop/Qwen3.5-2B-GRPO}"
 BASE_MODEL_DIR="${BASE_MODEL_DIR:-${PROJECT_ROOT}/models/Qwen3.5-2B}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/checkpoints_hf/alfworld/Qwen3.5-2B-GRPO/iter_0000099}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_ROOT}/checkpoints_hf/webshop/Qwen3.5-2B-GRPO}"
 MEGATRON_PATH="${MEGATRON_PATH:-${PROJECT_ROOT}/Megatron-LM}"
-if [[ -n "${PYTHON_BIN:-}" ]]; then
-    if [[ ! -x "${PYTHON_BIN}" ]]; then
-        echo "Python is not executable: ${PYTHON_BIN}" >&2
-        exit 1
-    fi
-elif [[ -x "${PROJECT_ROOT}/.venv/bin/python" ]]; then
-    PYTHON_BIN="${PROJECT_ROOT}/.venv/bin/python"
-else
-    PYTHON_BIN=python3
+PYTHON_BIN="/mnt/cpfs/users/wxh/slime-OPD/.venv/bin/python"
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+    echo "Python is not executable: ${PYTHON_BIN}" >&2
+    exit 1
 fi
 
-if [[ ! -f "${CHECKPOINT_DIR}/.metadata" || ! -f "${CHECKPOINT_DIR}/common.pt" ]]; then
-    echo "Missing torch_dist checkpoint metadata in ${CHECKPOINT_DIR}" >&2
+if [[ ! -d "${CHECKPOINT_ROOT}" ]]; then
+    echo "Missing checkpoint root: ${CHECKPOINT_ROOT}" >&2
     exit 1
 fi
 if [[ ! -f "${BASE_MODEL_DIR}/config.json" ]]; then
@@ -34,11 +29,6 @@ if [[ ! -d "${MEGATRON_PATH}/megatron" ]]; then
     echo "Missing Megatron-LM in ${MEGATRON_PATH}" >&2
     exit 1
 fi
-if [[ -e "${OUTPUT_DIR}" ]]; then
-    echo "Output already exists: ${OUTPUT_DIR}" >&2
-    exit 1
-fi
-
 export PYTHONPATH="${REPO_ROOT}:${MEGATRON_PATH}${PYTHONPATH:+:${PYTHONPATH}}"
 export PYTHONUNBUFFERED=1
 export FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE:-${PROJECT_ROOT}}"
@@ -58,32 +48,11 @@ print(vocab_size)
 PY
 )"
 
-mkdir -p "$(dirname -- "${OUTPUT_DIR}")"
-PARTIAL_DIR="${OUTPUT_DIR}.partial.$$"
-if [[ -e "${PARTIAL_DIR}" ]]; then
-    echo "Temporary output already exists: ${PARTIAL_DIR}" >&2
-    exit 1
-fi
-cleanup() {
-    if [[ -d "${PARTIAL_DIR}" ]]; then
-        rm -rf -- "${PARTIAL_DIR}"
-    fi
-}
-trap cleanup EXIT
+mkdir -p "${PROJECT_ROOT}/checkpoints_hf/alfworld" "${OUTPUT_ROOT}"
 
-echo "Converting ${CHECKPOINT_DIR}"
-echo "Base model: ${BASE_MODEL_DIR}"
-echo "Output: ${OUTPUT_DIR}"
-
-"${PYTHON_BIN}" "${REPO_ROOT}/tools/convert_torch_dist_to_hf.py" \
-    --model-name qwen3_5 \
-    --input-dir "${CHECKPOINT_DIR}" \
-    --output-dir "${PARTIAL_DIR}" \
-    --origin-hf-dir "${BASE_MODEL_DIR}" \
-    --add-missing-from-origin-hf \
-    --vocab-size "${VOCAB_SIZE}"
-
-"${PYTHON_BIN}" - "${PARTIAL_DIR}" "${BASE_MODEL_DIR}" <<'PY'
+validate_output() {
+    local output_dir=$1
+    "${PYTHON_BIN}" - "${output_dir}" "${BASE_MODEL_DIR}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -107,7 +76,58 @@ if base_index_path.is_file():
         raise SystemExit(f"Converted checkpoint is missing {len(missing)} base model tensors")
 print(f"Validated {len(weight_map)} model tensors in {len(set(weight_map.values()))} files")
 PY
+}
 
-mv -- "${PARTIAL_DIR}" "${OUTPUT_DIR}"
-trap - EXIT
-echo "Hugging Face checkpoint ready: ${OUTPUT_DIR}"
+mapfile -d '' CHECKPOINT_DIRS < <(
+    find "${CHECKPOINT_ROOT}" -mindepth 1 -maxdepth 1 -type d -name 'iter_*' -print0 | sort -z
+)
+if [[ ${#CHECKPOINT_DIRS[@]} -eq 0 ]]; then
+    echo "No iter_* checkpoint directories found in ${CHECKPOINT_ROOT}" >&2
+    exit 1
+fi
+
+echo "Base model: ${BASE_MODEL_DIR}"
+echo "Checkpoint root: ${CHECKPOINT_ROOT}"
+echo "Output root: ${OUTPUT_ROOT}"
+
+for CHECKPOINT_DIR in "${CHECKPOINT_DIRS[@]}"; do
+    if [[ ! -f "${CHECKPOINT_DIR}/.metadata" || ! -f "${CHECKPOINT_DIR}/common.pt" ]]; then
+        echo "Skipping incomplete torch_dist checkpoint: ${CHECKPOINT_DIR}" >&2
+        continue
+    fi
+
+    CHECKPOINT_NAME=$(basename -- "${CHECKPOINT_DIR}")
+    OUTPUT_DIR="${OUTPUT_ROOT}/${CHECKPOINT_NAME}"
+    if [[ -e "${OUTPUT_DIR}" ]]; then
+        echo "Output already exists; validating and skipping: ${OUTPUT_DIR}"
+        validate_output "${OUTPUT_DIR}"
+        continue
+    fi
+
+    PARTIAL_DIR="${OUTPUT_DIR}.partial.$$"
+    if [[ -e "${PARTIAL_DIR}" ]]; then
+        echo "Temporary output already exists: ${PARTIAL_DIR}" >&2
+        exit 1
+    fi
+    cleanup() {
+        if [[ -d "${PARTIAL_DIR}" ]]; then
+            rm -rf -- "${PARTIAL_DIR}"
+        fi
+    }
+    trap cleanup EXIT
+
+    echo "Converting ${CHECKPOINT_DIR}"
+    echo "Output: ${OUTPUT_DIR}"
+    "${PYTHON_BIN}" "${REPO_ROOT}/tools/convert_torch_dist_to_hf.py" \
+        --model-name qwen3_5 \
+        --input-dir "${CHECKPOINT_DIR}" \
+        --output-dir "${PARTIAL_DIR}" \
+        --origin-hf-dir "${BASE_MODEL_DIR}" \
+        --add-missing-from-origin-hf \
+        --vocab-size "${VOCAB_SIZE}"
+
+    validate_output "${PARTIAL_DIR}"
+    mv -- "${PARTIAL_DIR}" "${OUTPUT_DIR}"
+    trap - EXIT
+    echo "Hugging Face checkpoint ready: ${OUTPUT_DIR}"
+done

@@ -265,15 +265,19 @@ def log_rollout_data(
         response_lengths = rollout_data["response_lengths"]
         loss_masks = rollout_data["loss_masks"]
         total_lengths = rollout_data["total_lengths"]
-        # Same per-rollout denominators the training loss uses, so reported
-        # token metrics live in the same per-rollout mean space as the gradient.
+        # Reuse the training loss's denominators for reported token metrics.
+        # Per-turn mode supplies each turn's own mask sum to the reducer below.
         rollout_mask_sums = rollout_data.get("rollout_mask_sums", None)
-        # For per-rollout-mean metrics: ``rollout_log_metric_contribution``
+        # For rollout/turn-mean metrics: ``rollout_log_metric_contribution``
         # produces the ``(sum, count)`` tuple so gather_log_data's
         # ``Σsum / Σcount`` lands on ``sum_DP_full / num_rollouts`` — the
         # same number train_one_step reports for the same samples.
         dp_world = mpu.get_data_parallel_world_size(with_context_parallel=False)
-        num_rollouts_in_rollout = rollout_data.get("num_valid_rollouts", sum(rollout_data["global_batch_sizes"]))
+        num_rollouts_in_rollout = (
+            sum(rollout_data["global_batch_sizes"])
+            if getattr(args, "per_turn_loss", False)
+            else rollout_data.get("num_valid_rollouts", sum(rollout_data["global_batch_sizes"]))
+        )
 
         # raw_reward is kept whole for pass@k; use only this rank's training
         # samples here so uneven DP partitions still produce the batch mean.
@@ -326,7 +330,7 @@ def log_rollout_data(
                             total_lengths,
                             response_lengths,
                             loss_masks,
-                            rollout_mask_sums,
+                            None if getattr(args, "per_turn_loss", False) else rollout_mask_sums,
                         )
                         # Compute (sum, count) via the shared helper so this
                         # path and the unit tests stay in sync.

@@ -905,6 +905,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             reset_arg(parser, "--seed", type=int, default=1234)
             reset_arg(parser, "--clip-grad", type=float, default=1.0)
             reset_arg(parser, "--calculate-per-token-loss", action="store_true")
+            parser.add_argument(
+                "--per-turn-loss",
+                action="store_true",
+                default=False,
+                help="Average masked token loss within each turn, then average valid turns across the optimizer step.",
+            )
             reset_arg(parser, "--lr", type=float, default=1e-6)
 
             parser.add_argument(
@@ -1802,6 +1808,8 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 
 def slime_validate_args(args):
+    if getattr(args, "per_turn_loss", False) and args.calculate_per_token_loss:
+        raise ValueError("--per-turn-loss and --calculate-per-token-loss are mutually exclusive")
     args.eval_datasets = _resolve_eval_datasets(args)
 
     if args.kl_coef != 0 or args.use_kl_loss:

@@ -1,4 +1,4 @@
-"""Per-rollout DP/microbatch scheduling.
+"""DP/microbatch scheduling for rollout-grouped training samples.
 
 Pure-Python logic that decides, for one rollout's worth of sample lengths,
 how to group samples into micro-batches and which DP rank owns each mbs.
@@ -7,8 +7,8 @@ under CPU-only CI.
 
 The scheduling philosophy is **pack first, distribute second**:
 
-  1. Group samples by rollout id (``rollout_indices[i]`` =
-     ``samples[i].index``) and split rollouts into steps of
+  1. Group samples by rollout id (``rollout_indices[i]`` identifies the
+     trajectory that emitted sample ``i``) and split rollouts into steps of
      ``global_batch_size`` rollouts each. In the common case one rollout
      emits one training sample so this is the same as a contiguous chunk;
      under compact / subagent one rollout may emit multiple training
@@ -87,6 +87,7 @@ def build_dp_schedule(
     *,
     global_batch_size: int,
     rollout_indices: list[int],
+    turn_validity: list[bool] | None = None,
 ) -> tuple[list[list[int]], list[list[list[int]]], list[int], list[int]]:
     """Compute the per-rank DP partition and micro-batch schedule.
 
@@ -104,11 +105,14 @@ def build_dp_schedule(
             rollouts are included when ``include_partial_train_step`` is set.
         rollout_indices: rollout id for each sample (``samples[i].index``).
             Samples sharing the same id are kept together in one step.
+        turn_validity: Whether each sample has a nonzero original loss mask.
+            Required only for ``--per-turn-loss`` and computed before DP
+            partitioning, so every rank receives the same step divisor.
 
     Returns:
         ``(partitions, micro_batch_indices, num_microbatches, global_batch_sizes)``.
-        ``global_batch_sizes[s]`` = loss divisor for step s (constant
-        ``global_batch_size`` even for a partial step).
+        ``global_batch_sizes[s]`` = loss divisor for step s: rollout count
+        by default, valid turn count with ``--per-turn-loss``.
     """
     dp_size = train_parallel_config["dp_size"]
     cp_size = train_parallel_config["cp_size"]
@@ -133,6 +137,10 @@ def build_dp_schedule(
         rollout_id_to_samples.setdefault(rid, []).append(sample_pos)
     rollout_ids = list(rollout_id_to_samples.keys())
 
+    per_turn_loss = getattr(args, "per_turn_loss", False)
+    if per_turn_loss and (turn_validity is None or len(turn_validity) != len(total_lengths)):
+        raise ValueError("Per-turn loss requires one loss-mask validity value per training sample")
+
     include_partial = getattr(args, "include_partial_train_step", False)
     if include_partial and (args.use_dynamic_batch_size or args.micro_batch_size != 1):
         raise ValueError("Partial training steps require static micro-batches of size 1")
@@ -151,6 +159,10 @@ def build_dp_schedule(
     for step_i in range(num_steps):
         step_rollouts = rollout_ids[step_i * global_batch_size : (step_i + 1) * global_batch_size]
         sample_indices = [pos for rid in step_rollouts for pos in rollout_id_to_samples[rid]]
+        if per_turn_loss:
+            valid_turn_count = sum(turn_validity[pos] for pos in sample_indices)
+            if valid_turn_count == 0:
+                raise ValueError(f"Training step {step_i} has no turn with a nonzero loss mask")
         # A partial step retains the full configured loss divisor, matching a
         # fixed-size PPO minibatch. Negative indices denote zero-loss copies
         # needed only to give all DP ranks the same number of micro-batches.
@@ -158,7 +170,7 @@ def build_dp_schedule(
             while len(sample_indices) < align_to or len(sample_indices) % align_to:
                 sample_indices.append(-sample_indices[0] - 1)
         step_lengths = [total_lengths[i if i >= 0 else -i - 1] for i in sample_indices]
-        global_batch_sizes.append(global_batch_size)
+        global_batch_sizes.append(valid_turn_count if per_turn_loss else global_batch_size)
         assert len(sample_indices) >= dp_size, (
             f"step {step_i}: {len(sample_indices)} samples < dp_size {dp_size}; "
             f"each step needs at least one sample per rank."

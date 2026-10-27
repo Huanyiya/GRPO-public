@@ -54,7 +54,7 @@ def get_sum_of_sample_mean(
     """
     Calculate correct sample mean for CP.
 
-    The default (``sample_denoms=None``) is the legacy per-sample mean: each
+    The default (``sample_denoms=None``) is a per-sample/turn mean: each
     sample's denominator is its own ``loss_mask.sum()``. Callers that want a
     per-rollout token-weighted mean pass pre-computed per-sample denominators
     (already as GPU tensors — see actor side) where every sample in the same
@@ -143,9 +143,9 @@ def reduce_train_step_metrics(
            num_tokens off the FULL (not chunked) masks; the
            ``cp_factor = cp_size`` multiplier cancels that inflation, leaving
            the genuine per-token average.
-         - per-rollout-mean: divisor = constant ``step_global_batch_size`` from
-           the rollout side, never all-reduced, so no CP inflation to cancel
-           and ``cp_factor = 1``.
+         - per-rollout/per-turn mean: divisor = ``step_global_batch_size``
+           from the rollout side, never all-reduced, so no CP inflation to
+           cancel and ``cp_factor = 1``.
 
     Tests pass a mock ``dp_with_cp_group`` and monkeypatch ``dist.all_reduce``
     to a no-op, then pre-aggregate virtual ranks themselves — this exercises

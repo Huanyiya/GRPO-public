@@ -1078,16 +1078,15 @@ def policy_loss_function(
         pg_loss, modified_response_masks, tis_metrics = tis_func(**tis_kwargs)
 
         # [decouple IS and rejection] Rebuild sum_of_sample_mean with
-        # modified_response_masks for numerator correction (rejected tokens
-        # zeroed in pg_loss). Denominators stay the precomputed per-rollout
-        # totals from ``rollout_mask_sums`` (based on original loss_masks) —
-        # same normalizer as the outer reducer, so pg_loss and the rest of the
-        # reported metrics live in the same per-rollout-mean space.
+        # modified_response_masks. Per-turn mode divides by each turn's
+        # remaining valid tokens; other modes retain their original reducer.
+        # The optimizer-step divisor still counts turns with a nonzero original
+        # loss mask, so fully rejected turns contribute zero to that step.
         sum_of_sample_mean = get_sum_of_sample_mean(
             total_lengths,
             response_lengths,
             modified_response_masks,
-            batch["rollout_mask_sums"],
+            None if getattr(args, "per_turn_loss", False) else batch["rollout_mask_sums"],
             args.calculate_per_token_loss,
         )
 
@@ -1296,14 +1295,13 @@ def loss_function(
 
     Args:
         args: Configuration specifying `loss_type`, `calculate_per_token_loss`,
+            `per_turn_loss`,
             and optionally `custom_loss_function_path`.
         batch: Mini-batch with "loss_masks", "response_lengths", and other
             keys required by the selected loss function.
         num_microbatches: Number of gradient accumulation steps.
-        step_global_batch_size: Sample count for the current training step
-            (total across DP). Replaces the legacy ``args.global_batch_size``
-            fallback so the train side stops depending on "every DP rank holds
-            the same N samples".
+        step_global_batch_size: Global loss divisor for this optimizer step:
+            valid turn count in per-turn mode, rollout count otherwise.
         logits: Model outputs (policy or value head).
 
     Returns:
@@ -1320,7 +1318,7 @@ def loss_function(
         batch["total_lengths"],
         batch["response_lengths"],
         batch["loss_masks"],
-        batch["rollout_mask_sums"],
+        None if getattr(args, "per_turn_loss", False) else batch["rollout_mask_sums"],
         args.calculate_per_token_loss,
     )
 
@@ -1349,7 +1347,10 @@ def loss_function(
     if args.allgather_cp and mpu.get_context_parallel_world_size() > 1:
         loss = loss + 0 * logits.sum()
 
-    # Here we need to divide by cp_size because to cancel the multiply in Megatron.
+    # Megatron divides each microbatch gradient by num_microbatches and
+    # averages over DP*CP. The factor below cancels both, leaving the sum of
+    # CP-local turn means divided once by the global valid-turn count in
+    # per-turn mode (or the existing rollout count in per-rollout mode).
     if not args.calculate_per_token_loss:
         loss = (
             loss
@@ -1368,7 +1369,7 @@ def loss_function(
             # values[0] is the consumer's reporting denominator after
             # all-reduce. For per-token-loss it must equal step total tokens
             # (only known by summing per-mb num_tokens across mbs / DP). For
-            # per-rollout-mean it is a constant — ``step_global_batch_size`` —
+            # per-rollout/per-turn mean it is a constant — ``step_global_batch_size`` —
             # so we leave a 0 placeholder here and let ``train_one_step``
             # substitute the constant directly, instead of routing it through
             # per-mb fractions.

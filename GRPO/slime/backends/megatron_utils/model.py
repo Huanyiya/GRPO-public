@@ -532,13 +532,9 @@ def train_one_step(
         optimizer (MegatronOptimizer): Optimizer instance.
         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
         num_microbatches (int): Number of microbatches to process.
-        step_global_batch_size (int): Rollout count for this training step
-            (total across DP; one "rollout" = one execution of one of the
-            ``n_samples_per_prompt`` rollouts, which may emit >1 training
-            sample under compact / subagent). Used both as the loss
-            normalizer inside the closure and as the LR scheduler
-            ``increment``. In the common case (1 rollout = 1 sample) this
-            equals the per-step sample count, so behavior is unchanged.
+        step_global_batch_size (int): Global loss divisor for this training
+            step. It is the count of valid turns with ``--per-turn-loss`` and
+            the rollout count otherwise. It is also the LR scheduler increment.
 
     Returns:
         tuple[dict[str, float], float]: Reduced loss dictionary (last stage only)
@@ -677,8 +673,7 @@ def train_one_step(
         # Update parameters.
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
-        # Update learning rate. Use the per-step global_batch_size when dynamic
-        # batching is on so the scheduler's samples-seen counter tracks reality.
+        # Update learning rate with the step's global loss-unit count.
         assert update_successful
         opt_param_scheduler.step(increment=step_global_batch_size)
 
@@ -725,12 +720,10 @@ def train(
         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
         data_iterator (Sequence[DataIterator]): Iterable(s) yielding training batches.
         num_microbatches (Sequence[int]): Microbatches per step in the rollout.
-        global_batch_sizes (Sequence[int]): Rollout count per step (total
-            across DP; one "rollout" = one execution of one of the
-            ``n_samples_per_prompt`` rollouts of a prompt). Same length as
-            ``num_microbatches``; consumed by ``train_one_step`` for loss
-            scaling and LR scheduler increments. Equals per-step sample count
-            in the common case (1 rollout = 1 sample).
+        global_batch_sizes (Sequence[int]): Loss divisor per step, shared
+            across DP ranks. Counts valid turns in per-turn mode and rollouts
+            otherwise. Consumed by ``train_one_step`` for loss scaling and
+            LR scheduler increments.
     """
     args = get_args()
 
