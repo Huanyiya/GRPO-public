@@ -757,6 +757,40 @@ class RolloutManager:
                     json.dump(record, output_file, ensure_ascii=False, default=str)
                     output_file.write("\n")
 
+        # Keep a readable, task-agnostic record of every training rollout.  In
+        # particular, agentic rollouts can place the full environment trace in
+        # ``metadata``; dumping the metadata verbatim makes the text file useful
+        # without adding task-specific knowledge here.
+        if not evaluation and (path_template := getattr(self.args, "save_rollout_text_data", None)) is not None:
+            path = Path(path_template.format(rollout_id=rollout_id))
+            logger.info(f"Save rollout text data to {path}")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+            try:
+                with temporary_path.open("w", encoding="utf-8") as output_file:
+                    output_file.write(f"rollout_id: {rollout_id}\n")
+                    output_file.write(f"num_samples: {len(data)}\n")
+                    for position, sample in enumerate(data, start=1):
+                        output_file.write(f"\n{'=' * 80}\n")
+                        output_file.write(f"sample: {position}/{len(data)}\n")
+                        output_file.write(f"index: {sample.index}\n")
+                        output_file.write(f"rollout_id: {sample.rollout_id}\n")
+                        output_file.write(f"group_index: {sample.group_index}\n")
+                        output_file.write(f"status: {sample.status.value}\n")
+                        output_file.write(f"reward: {sample.reward}\n")
+                        output_file.write(f"response_length: {sample.response_length}\n")
+                        output_file.write("\n[PROMPT]\n")
+                        output_file.write(f"{sample.prompt}\n")
+                        output_file.write("\n[RESPONSE]\n")
+                        output_file.write(f"{sample.response}\n")
+                        output_file.write("\n[METADATA]\n")
+                        json.dump(sample.metadata, output_file, ensure_ascii=False, indent=2, default=str)
+                        output_file.write("\n")
+                os.replace(temporary_path, path)
+            finally:
+                if temporary_path.exists():
+                    temporary_path.unlink()
+
     def _post_process_rewards(self, samples: list[Sample] | list[list[Sample]]):
         if self.custom_reward_post_process_func is not None:
             return self.custom_reward_post_process_func(self.args, samples)

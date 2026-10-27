@@ -1297,6 +1297,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "The file will be saved to `save_rollout_outputs.format(rollout_id)`."
                 ),
             )
+            parser.add_argument(
+                "--save-rollout-text-data",
+                type=str,
+                default=None,
+                help=(
+                    "Save human-readable rollout samples as UTF-8 text. "
+                    "The file will be saved to `save_rollout_text_data.format(rollout_id)`."
+                ),
+            )
             # --load-debug-rollout-data, --debug-rollout-only, --debug-train-only
             # are parsed early in _pre_parse_mode() and merged later.
             parser.add_argument(

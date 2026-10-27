@@ -121,6 +121,7 @@ ROLLOUT_ARGS=(
   --rollout-temperature 1.0
   --rollout-top-p 1.0
   --balance-data
+  --save-rollout-text-data "${SAVE_DIR}/rollout-text/rollout_{rollout_id}.txt"
 )
 
 GRPO_ARGS=(
