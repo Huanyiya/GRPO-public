@@ -48,3 +48,4 @@ dist/
 !.env.example
 *.pem
 *.key
+hf_cache/
