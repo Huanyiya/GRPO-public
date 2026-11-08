@@ -12,9 +12,29 @@ from slime.utils.http_utils import post
 from slime.utils.types import Sample
 
 
+_SEARCHQA_STOP_SEQUENCES = ("</search>", "</answer>")
+
+
 def _setting(args: Any, name: str, default: Any) -> Any:
     value = getattr(args, name, None)
     return default if value is None else value
+
+
+def _sampling_params_for_turn(sampling_params: dict) -> dict:
+    """Stop at a complete SearchQA action while retaining its closing tag.
+
+    SGLang returns token IDs and log probabilities for the exact output it
+    generated. Keeping the matched stop sequence avoids any response trimming,
+    so those arrays remain aligned with the trainable response and loss mask.
+    """
+    existing_stop = sampling_params.get("stop") or []
+    if isinstance(existing_stop, str):
+        existing_stop = [existing_stop]
+    return {
+        **sampling_params,
+        "stop": list(dict.fromkeys([*existing_stop, *_SEARCHQA_STOP_SEQUENCES])),
+        "no_stop_trim": True,
+    }
 
 
 def _turn_sample(base: Sample, turn: int, max_steps: int, prompt: str, prompt_ids: list[int]) -> Sample:
@@ -47,12 +67,12 @@ def _output_tokens(output: dict[str, Any]) -> tuple[list[int], list[float], str]
 
 
 async def generate(args: Any, sample: Sample, sampling_params: dict, evaluation: bool = False):
-    if evaluation:
-        raise ValueError("This SearchQA launcher does not configure evaluation")
     if args.partial_rollout:
         raise ValueError("Partial rollout is not supported for SearchQA episodes")
-    if sample.index is None or sample.group_index is None:
-        raise ValueError("SearchQA training samples require index and group_index")
+    if sample.index is None:
+        raise ValueError("SearchQA samples require an index")
+    if sample.group_index is None and not evaluation:
+        raise ValueError("SearchQA training samples require group_index")
 
     max_steps = int(_setting(args, "searchqa_max_steps", 4))
     history_length = int(_setting(args, "searchqa_history_length", 4))
@@ -90,7 +110,7 @@ async def generate(args: Any, sample: Sample, sampling_params: dict, evaluation:
             prompt_ids = tokenizer.encode(chat_prompt, add_special_tokens=False)
             # SDA SearchQA uses data.truncation=left at max_prompt_length=4096.
             prompt_ids = prompt_ids[-int(args.rollout_max_prompt_len):]
-            parameters = sampling_params.copy()
+            parameters = _sampling_params_for_turn(sampling_params)
             parameters["max_new_tokens"] = min(
                 int(parameters.get("max_new_tokens", args.rollout_max_response_len)),
                 int(args.rollout_max_response_len),

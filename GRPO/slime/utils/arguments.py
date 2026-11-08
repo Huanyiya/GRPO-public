@@ -464,6 +464,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "use `slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std_with_fallback`."
                 ),
             )
+            parser.add_argument(
+                "--dynamic-sampling-max-groups",
+                type=int,
+                default=None,
+                help="Fail if dynamic filtering cannot fill one rollout after this many generated groups.",
+            )
 
             # partial rollout
             parser.add_argument(
@@ -1233,6 +1239,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "otherwise, will use rollout step for most info other than train/*. "
                 ),
             )
+            parser.add_argument("--use-swanlab", action="store_true", default=False)
+            parser.add_argument("--swanlab-mode", choices=["online", "offline", "local", "disabled"], default="online")
+            parser.add_argument("--swanlab-dir", type=str, default=None)
+            parser.add_argument("--swanlab-key", type=str, default=None)
+            parser.add_argument("--swanlab-workspace", type=str, default=None)
+            parser.add_argument("--swanlab-group", type=str, default=None)
+            parser.add_argument("--swanlab-run-id", type=str, default=None)
+            reset_arg(parser, "--swanlab-project", type=str, default=None)
             parser.add_argument(
                 "--log-multi-turn",
                 action="store_true",

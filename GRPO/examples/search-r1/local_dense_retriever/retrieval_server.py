@@ -16,8 +16,14 @@
 # Adapted from https://github.com/PeterGriffinJin/Search-R1/blob/main/search_r1/search/retrieval_server.py
 
 import argparse
+import asyncio
 import json
+import logging
+import os
+import time
 import warnings
+from contextlib import asynccontextmanager
+from pathlib import Path
 
 import datasets
 import faiss
@@ -27,7 +33,9 @@ import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
 from tqdm import tqdm
-from transformers import AutoModel, AutoTokenizer
+
+
+logger = logging.getLogger("searchqa.retriever.server")
 
 
 def load_corpus(corpus_path: str):
@@ -41,6 +49,8 @@ def load_docs(corpus, doc_idxs):
 
 
 def load_model(model_path: str, use_fp16: bool = False):
+    from transformers import AutoModel, AutoTokenizer
+
     model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
     model.eval()
     model.cuda()
@@ -246,8 +256,12 @@ class DenseRetriever(BaseRetriever):
         scores = []
         for start_idx in tqdm(range(0, len(query_list), self.batch_size), desc="Retrieval process: "):
             query_batch = query_list[start_idx : start_idx + self.batch_size]
+            batch_size = len(query_batch)
+            started = time.perf_counter()
             batch_emb = self.encoder.encode(query_batch)
+            encoded = time.perf_counter()
             batch_scores, batch_idxs = self.index.search(batch_emb, k=num)
+            searched = time.perf_counter()
             batch_scores = batch_scores.tolist()
             batch_idxs = batch_idxs.tolist()
 
@@ -256,12 +270,24 @@ class DenseRetriever(BaseRetriever):
             batch_results = load_docs(self.corpus, flat_idxs)
             # chunk them back
             batch_results = [batch_results[i * num : (i + 1) * num] for i in range(len(batch_idxs))]
+            loaded = time.perf_counter()
 
             results.extend(batch_results)
             scores.extend(batch_scores)
 
             del batch_emb, batch_scores, batch_idxs, query_batch, flat_idxs, batch_results
             torch.cuda.empty_cache()
+            finished = time.perf_counter()
+            logger.info(
+                "retrieval_stages queries=%d encode_s=%.3f faiss_s=%.3f docs_s=%.3f "
+                "empty_cache_s=%.3f total_s=%.3f",
+                batch_size,
+                encoded - started,
+                searched - encoded,
+                loaded - searched,
+                finished - loaded,
+                finished - started,
+            )
 
         if return_score:
             return results, scores
@@ -322,11 +348,74 @@ class QueryRequest(BaseModel):
     return_scores: bool = False
 
 
-app = FastAPI()
+RETRIEVAL_BATCH_SIZE = 64
+RETRIEVAL_BATCH_WAIT_SECONDS = 0.01
+
+
+async def retrieval_worker(app: FastAPI):
+    """Combine concurrent requests into batches of at most 64 queries."""
+    queue = app.state.retrieval_queue
+    while True:
+        pending = [await queue.get()]
+        await asyncio.sleep(RETRIEVAL_BATCH_WAIT_SECONDS)
+        while len(pending) < RETRIEVAL_BATCH_SIZE:
+            try:
+                pending.append(queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+
+        grouped = {}
+        for query, topk, future, enqueued_at in pending:
+            if not future.cancelled():
+                grouped.setdefault(topk, []).append((query, future, enqueued_at))
+
+        for topk, entries in grouped.items():
+            started = time.perf_counter()
+            waits = [started - enqueued_at for _, _, enqueued_at in entries]
+            logger.info(
+                "batch_start queries=%d topk=%d queue_remaining=%d wait_avg_s=%.3f wait_max_s=%.3f",
+                len(entries), topk, queue.qsize(), sum(waits) / len(waits), max(waits),
+            )
+            try:
+                results, scores = retriever.batch_search(
+                    [query for query, _, _ in entries], topk, True
+                )
+                for (_, future, _), documents, document_scores in zip(entries, results, scores, strict=True):
+                    if not future.done():
+                        future.set_result((documents, document_scores))
+                logger.info(
+                    "batch_end queries=%d service_s=%.3f queue_remaining=%d",
+                    len(entries), time.perf_counter() - started, queue.qsize(),
+                )
+            except Exception as exc:
+                logger.exception(
+                    "batch_error queries=%d service_s=%.3f queue_remaining=%d",
+                    len(entries), time.perf_counter() - started, queue.qsize(),
+                )
+                for _, future, _ in entries:
+                    if not future.done():
+                        future.set_exception(exc)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.retrieval_queue = asyncio.Queue()
+    worker = asyncio.create_task(retrieval_worker(app))
+    try:
+        yield
+    finally:
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.post("/retrieve")
-def retrieve_endpoint(request: QueryRequest):
+async def retrieve_endpoint(request: QueryRequest):
     """
     Endpoint that accepts queries and performs retrieval.
 
@@ -350,25 +439,20 @@ def retrieve_endpoint(request: QueryRequest):
         ]
     }
     """
-    if not request.topk:
-        request.topk = config.retrieval_topk  # fallback to default
-
-    # Perform batch retrieval
-    tmp = retriever.batch_search(query_list=request.queries, num=request.topk, return_score=request.return_scores)
-
-    scores = []
-    try:
-        results, scores = tmp
-    except ValueError:
-        results = tmp
+    topk = request.topk or config.retrieval_topk
+    loop = asyncio.get_running_loop()
+    futures = [loop.create_future() for _ in request.queries]
+    for query, future in zip(request.queries, futures, strict=True):
+        await app.state.retrieval_queue.put((query, topk, future, time.perf_counter()))
+    results_and_scores = await asyncio.gather(*futures)
 
     # Format response
     resp = []
-    for i, single_result in enumerate(results):
-        if scores:
+    for single_result, scores in results_and_scores:
+        if request.return_scores:
             # If scores are returned, combine them with results
             combined = []
-            for doc, score in zip(single_result, scores[i], strict=True):
+            for doc, score in zip(single_result, scores, strict=True):
                 combined.append({"document": doc, "score": score})
             resp.append(combined)
         else:
@@ -396,8 +480,24 @@ if __name__ == "__main__":
         "--retriever_model", type=str, default="intfloat/e5-base-v2", help="Path of the retriever model."
     )
     parser.add_argument("--faiss_gpu", action="store_true", help="Use GPU for computation")
+    parser.add_argument(
+        "--metrics_log",
+        default=os.environ.get(
+            "SEARCH_RETRIEVER_LOG",
+            str(Path(__file__).resolve().parents[4] / "logs/searchqa/retriever-server.log"),
+        ),
+        help="Path to retrieval queue and batch timing logs.",
+    )
 
     args = parser.parse_args()
+
+    Path(args.metrics_log).parent.mkdir(parents=True, exist_ok=True)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    handler = logging.FileHandler(args.metrics_log)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    logger.info("server_start faiss_gpu=%s batch_max=%d index=%s", args.faiss_gpu, RETRIEVAL_BATCH_SIZE, args.index_path)
 
     # 1) Build a config (could also parse from arguments).
     #    In real usage, you'd parse your CLI arguments or environment variables.
@@ -411,11 +511,12 @@ if __name__ == "__main__":
         retrieval_pooling_method="mean",
         retrieval_query_max_length=256,
         retrieval_use_fp16=True,
-        retrieval_batch_size=512,
+        retrieval_batch_size=RETRIEVAL_BATCH_SIZE,
     )
 
     # 2) Instantiate a global retriever so it is loaded once and reused.
     retriever = get_retriever(config)
+    logger.info("server_ready")
 
     # 3) Launch the server. By default, it listens on http://127.0.0.1:8000
     uvicorn.run(app, host="0.0.0.0", port=8000)

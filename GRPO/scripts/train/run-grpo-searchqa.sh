@@ -19,8 +19,11 @@ export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 SEARCH_URL=${SEARCH_URL:-http://127.0.0.1:8000/retrieve}
 SEARCH_API_STYLE=${SEARCH_API_STYLE:-batch}
 SEARCH_TOPK=${SEARCH_TOPK:-3}
-SEARCH_TIMEOUT=${SEARCH_TIMEOUT:-60}
-export SEARCH_URL SEARCH_API_STYLE SEARCH_TOPK SEARCH_TIMEOUT
+SEARCH_TIMEOUT=${SEARCH_TIMEOUT:-180}
+SEARCH_MAX_CONCURRENCY=${SEARCH_MAX_CONCURRENCY:-64}
+SEARCH_CLIENT_LOG_DIR=${SEARCH_CLIENT_LOG_DIR:-${LOG_ROOT}/${TASK_NAME}}
+export SEARCH_URL SEARCH_API_STYLE SEARCH_TOPK SEARCH_TIMEOUT SEARCH_MAX_CONCURRENCY SEARCH_CLIENT_LOG_DIR
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 
 MODEL_DIR=${GRPO_CLI_LAST_VALUE[--hf-checkpoint]:-${MODEL_DIR:-${MODEL_PATH}}}
 INIT_CKPT=${GRPO_CLI_LAST_VALUE[--ref-load]:-${INIT_CKPT:-${MODEL_ROOT}/${MODEL_NAME}_torch_dist}}
@@ -28,7 +31,7 @@ SAVE_DIR=${GRPO_CLI_LAST_VALUE[--save]:-${SAVE_DIR:-${CHECKPOINT_ROOT}/${TASK_NA
 LOAD_DIR=${GRPO_CLI_LAST_VALUE[--load]:-${LOAD_DIR:-${SAVE_DIR}}}
 DATA_PATH=${GRPO_CLI_LAST_VALUE[--prompt-data]:-${SEARCHQA_TRAIN_DATA:-${DATA_ROOT}/SearchQA/searchR1_processed_direct/train.parquet}}
 EVAL_DATA_PATH=
-WANDB_DIR=${GRPO_CLI_LAST_VALUE[--wandb-dir]:-${WANDB_DIR:-${LOG_ROOT}/${TASK_NAME}/${MODEL_NAME}/wandb}}
+SWANLAB_DIR=${SWANLAB_DIR:-${LOG_ROOT}/${TASK_NAME}/${MODEL_NAME}/swanlab}
 DEFAULT_RAY_TMP_DIR=/tmp/ray-searchqa-$$
 RAY_TMP_DIR=${RAY_TMP_DIR:-${DEFAULT_RAY_TMP_DIR}}
 DEFAULT_WORKER_TMP_DIR=/tmp/searchqa-worker-$$
@@ -74,7 +77,7 @@ if [[ "${GRPO_DRY_RUN}" != true ]]; then
     echo "Search retriever is not ready at ${SEARCH_URL}" >&2
     exit 1
   fi
-  mkdir -p "${WANDB_DIR}" "${RAY_TMP_DIR}" "${RAY_LOG_ARCHIVE_DIR}" "${WORKER_TMP_DIR}"
+  mkdir -p "${SWANLAB_DIR}" "${RAY_TMP_DIR}" "${RAY_LOG_ARCHIVE_DIR}" "${WORKER_TMP_DIR}"
   cat > "${SGLANG_CONFIG_PATH}" <<EOF
 sglang:
   - name: default
@@ -112,7 +115,7 @@ ROLLOUT_ARGS=(
   --custom-reward-post-process-path slime_plugins.searchqa.rewards.normalize_turn_rewards
   --apply-chat-template-kwargs '{"enable_thinking": false}'
   --num-rollout 100
-  --rollout-batch-size 16
+  --rollout-batch-size 64
   --n-samples-per-prompt 8
   --num-steps-per-rollout 1
   --rollout-max-prompt-len 4096
@@ -129,8 +132,8 @@ GRPO_ARGS=(
   --kl-coef 0.0
   --use-kl-loss
   --kl-loss-type low_var_kl
-  --kl-loss-coef 0.001
-  --entropy-coef 0.0
+  --kl-loss-coef 0.01
+  --entropy-coef 0.001
   --eps-clip 0.2
   --eps-clip-high 0.2
   --eps-clip-c 3.0
@@ -155,35 +158,34 @@ OPTIMIZER_ARGS=(
   --optimizer adam
   --lr 1e-6
   --lr-decay-style constant
-  --weight-decay 0.1
+  --weight-decay 0.01
   --adam-beta1 0.9
-  --adam-beta2 0.98
+  --adam-beta2 0.999
   --override-opt-param-scheduler
 )
 
-WANDB_ARGS=(
-  --use-wandb
-  --wandb-mode online
-  --wandb-dir "${WANDB_DIR}"
-  --wandb-project "GRPO-${TASK_NAME}-${MODEL_NAME}"
-  --wandb-group "${TASK_NAME}-${MODEL_NAME}-nonthinking"
+SWANLAB_ARGS=(
+  --use-swanlab
+  --swanlab-mode "${SWANLAB_MODE:-online}"
+  --swanlab-dir "${SWANLAB_DIR}"
+  --swanlab-project "GRPO-${TASK_NAME}-${MODEL_NAME}"
+  --swanlab-group "${TASK_NAME}-${MODEL_NAME}-nonthinking"
 )
+if [[ -n "${SWANLAB_KEY:-}" ]]; then SWANLAB_ARGS+=(--swanlab-key "${SWANLAB_KEY}"); fi
+if [[ -n "${SWANLAB_WORKSPACE:-}" ]]; then SWANLAB_ARGS+=(--swanlab-workspace "${SWANLAB_WORKSPACE}"); fi
 
 PERF_ARGS=(
   --log-grpo-step-timing
   --grpo-step-timing-log-file "${STEP_TIMING_LOG_FILE:-${LOG_ROOT}/${TASK_NAME}/${MODEL_NAME}/step-timing.log}"
   --tensor-model-parallel-size 1
   --pipeline-model-parallel-size 1
-  --context-parallel-size 2
+  --context-parallel-size 1
   --sequence-parallel
   --use-distributed-optimizer
   --expert-model-parallel-size 1
   --expert-tensor-parallel-size 1
-  --recompute-granularity full
-  --recompute-method uniform
-  --recompute-num-layers 1
   --use-dynamic-batch-size
-  --max-tokens-per-gpu 24576
+  --max-tokens-per-gpu 16384
   --per-turn-loss
   --log-probs-chunk-size 1024
 )
@@ -196,7 +198,7 @@ SGLANG_ARGS=(
   # 512-token response budget, so give the server one token of headroom.
   --sglang-context-length 4609
   --sglang-server-concurrency 64
-  --sglang-mem-fraction-static 0.7
+  --sglang-mem-fraction-static 0.6
   --sglang-mamba-scheduler-strategy extra_buffer
 )
 
@@ -222,7 +224,7 @@ DEFAULT_TRAIN_ARGS=(
   "${GRPO_ARGS[@]}"
   "${WEIGHT_SYNC_ARGS[@]}"
   "${OPTIMIZER_ARGS[@]}"
-  "${WANDB_ARGS[@]}"
+  "${SWANLAB_ARGS[@]}"
   "${PERF_ARGS[@]}"
   "${SGLANG_ARGS[@]}"
   "${MISC_ARGS[@]}"
@@ -265,7 +267,8 @@ RUNTIME_ENV_JSON=$("${PYTHON_BIN}" - <<'PY'
 import json
 import os
 
-keys = ("SEARCH_URL", "SEARCH_API_STYLE", "SEARCH_TOPK", "SEARCH_TIMEOUT",
+keys = ("SEARCH_URL", "SEARCH_API_STYLE", "SEARCH_TOPK", "SEARCH_TIMEOUT", "SEARCH_MAX_CONCURRENCY",
+        "SEARCH_CLIENT_LOG_DIR",
         "TMPDIR", "TMP", "TEMP", "MASTER_ADDR", "MASTER_PORT",
         "SGLANG_HEALTH_CHECK_TIMEOUT", "SGLANG_WARMUP_TIMEOUT", "no_proxy", "NO_PROXY")
 values = {key: os.environ[key] for key in keys}

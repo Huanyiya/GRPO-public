@@ -15,6 +15,7 @@ from slime.utils.types import Sample
 from slime_plugins.searchqa.data import SearchQADataSource
 from slime_plugins.searchqa import rollout
 from slime_plugins.searchqa.rewards import normalize_turn_rewards
+from slime_plugins.searchqa.filter import keep_mixed_outcomes
 
 
 class FakeTokenizer:
@@ -148,8 +149,105 @@ def test_retriever_adapts_batch_and_single_query_apis(monkeypatch):
     ]
 
 
+def test_retriever_limits_concurrent_http_requests_to_64(monkeypatch):
+    monkeypatch.setenv("SEARCH_MAX_CONCURRENCY", "64")
+
+    async def run():
+        active = 0
+        peak = 0
+        release = asyncio.Event()
+
+        class FakeResponse:
+            async def __aenter__(self):
+                nonlocal active, peak
+                active += 1
+                peak = max(peak, active)
+                await release.wait()
+                return self
+
+            async def __aexit__(self, *args):
+                nonlocal active
+                active -= 1
+
+            def raise_for_status(self):
+                pass
+
+            async def json(self):
+                return {"result": [[{"document": {"contents": "Title\nBody"}}]]}
+
+        class FakeSession:
+            def post(self, url, *, json, timeout):
+                return FakeResponse()
+
+            async def close(self):
+                pass
+
+        monkeypatch.setattr("agent_system.searchqa.retriever.aiohttp.ClientSession", FakeSession)
+        clients = [SearchRetriever("http://unused/retrieve") for _ in range(65)]
+        tasks = [asyncio.create_task(client.search("query")) for client in clients]
+        try:
+            for _ in range(10):
+                await asyncio.sleep(0)
+            assert active == 64
+            assert peak == 64
+        finally:
+            release.set()
+            await asyncio.gather(*tasks)
+            await asyncio.gather(*(client.close() for client in clients))
+        assert peak == 64
+
+    asyncio.run(run())
+
+
+def test_retriever_writes_client_timing_log(monkeypatch, tmp_path):
+    import agent_system.searchqa.retriever as retriever_module
+
+    monkeypatch.setenv("SEARCH_CLIENT_LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(retriever_module, "_client_logger", None)
+
+    class FakeResponse:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        async def json(self):
+            return {"result": [[{"document": {"contents": "Title\nBody"}}]]}
+
+    class FakeSession:
+        def post(self, url, *, json, timeout):
+            return FakeResponse()
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(retriever_module.aiohttp, "ClientSession", FakeSession)
+
+    async def run():
+        client = SearchRetriever("http://unused/retrieve")
+        try:
+            await client.search("query")
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+    log_files = list(tmp_path.glob("retriever-client-*.log"))
+    assert len(log_files) == 1
+    assert "search outcome=ok wait_s=" in log_files[0].read_text()
+    logger = retriever_module._client_logger
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+        handler.close()
+
+
 def test_rollout_emits_one_sample_per_turn_with_left_truncation(monkeypatch):
     monkeypatch.setattr(rollout, "GenerateState", lambda args: SimpleNamespace(tokenizer=FakeTokenizer()))
+    payloads = []
+
     async def fake_search(self, query):
         return json.dumps({"result": "Doc 1: Paris"})
 
@@ -158,6 +256,7 @@ def test_rollout_emits_one_sample_per_turn_with_left_truncation(monkeypatch):
                  "<think>x</think><answer>Paris</answer>"]
 
     async def fake_post(url, payload, headers=None):
+        payloads.append(payload)
         response = responses.pop(0)
         ids = list(response.encode())
         return {
@@ -182,7 +281,9 @@ def test_rollout_emits_one_sample_per_turn_with_left_truncation(monkeypatch):
         metadata={"question": "background " * 500 + "Where is the Eiffel Tower?",
                   "ground_truth": {"target": ["Paris"]}, "data_source": "searchR1_nq"},
     )
-    turns = asyncio.run(rollout.generate(args, sample, {"max_new_tokens": 512}))
+    turns = asyncio.run(
+        rollout.generate(args, sample, {"max_new_tokens": 512, "stop": ["<|im_end|>"]})
+    )
     assert [turn.index for turn in turns] == [28, 29]
     assert [turn.rollout_id for turn in turns] == [7, 7]
     assert [turn.group_index for turn in turns] == [2, 2]
@@ -193,7 +294,56 @@ def test_rollout_emits_one_sample_per_turn_with_left_truncation(monkeypatch):
     assert len(turns[0].tokens) - turns[0].response_length == 4096
     assert all(len(turn.tokens) - turn.response_length <= 4096 for turn in turns)
     assert turns[0].tokens[:-turns[0].response_length] == list(turns[0].prompt.encode())[-4096:]
+    assert [payload["sampling_params"]["stop"] for payload in payloads] == [
+        ["<|im_end|>", "</search>", "</answer>"],
+        ["<|im_end|>", "</search>", "</answer>"],
+    ]
+    assert all(payload["sampling_params"]["no_stop_trim"] is True for payload in payloads)
+    for turn, response in zip(turns, [
+        "<think>x</think><search>Eiffel Tower</search>",
+        "<think>x</think><answer>Paris</answer>",
+    ], strict=True):
+        assert turn.response == response
+        assert turn.tokens[-turn.response_length:] == list(response.encode())
+        assert len(turn.rollout_log_probs) == turn.response_length
+        assert len(turn.loss_mask) == turn.response_length
+        assert all(turn.loss_mask)
     assert not responses
+
+
+def test_rollout_uses_the_same_stop_parameters_for_evaluation(monkeypatch):
+    monkeypatch.setattr(rollout, "GenerateState", lambda args: SimpleNamespace(tokenizer=FakeTokenizer()))
+    payloads = []
+
+    async def fake_post(url, payload, headers=None):
+        payloads.append(payload)
+        response = "<answer>Paris</answer>"
+        return {
+            "text": response,
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "output_token_logprobs": [(-0.1, token) for token in response.encode()],
+            },
+        }
+
+    monkeypatch.setattr(rollout, "post", fake_post)
+    args = SimpleNamespace(
+        partial_rollout=False, searchqa_max_steps=4, searchqa_history_length=4,
+        searchqa_invalid_action_coef=0.01, apply_chat_template_kwargs={"enable_thinking": False},
+        rollout_max_prompt_len=4096, rollout_max_response_len=512,
+        sglang_router_ip="127.0.0.1", sglang_router_port=30000,
+        use_rollout_routing_replay=False, rollout_top_p=1.0,
+    )
+    sample = Sample(
+        index=0,
+        metadata={"question": "Where is the Eiffel Tower?", "ground_truth": {"target": ["Paris"]}, "data_source": "searchR1_nq"},
+    )
+
+    turns = asyncio.run(rollout.generate(args, sample, {"max_new_tokens": 512}, evaluation=True))
+
+    assert len(turns) == 1
+    assert payloads[0]["sampling_params"]["stop"] == ["</search>", "</answer>"]
+    assert payloads[0]["sampling_params"]["no_stop_trim"] is True
 
 
 def test_cross_turn_reward_normalization_preserves_raw_rewards():
@@ -219,7 +369,7 @@ def test_cross_turn_reward_normalization_preserves_raw_rewards():
     assert normalize_turn_rewards(args, samples) == (raw, raw)
 
 
-def test_all_failed_group_does_not_reward_short_wrong_answers():
+def test_all_failed_group_normalizes_invalid_action_penalties():
     samples = [
         Sample(group_index=0, rollout_id=0, reward=-0.01, metadata={"episode_won": False}),
         Sample(group_index=0, rollout_id=1, reward=0.0, metadata={"episode_won": False}),
@@ -227,4 +377,28 @@ def test_all_failed_group_does_not_reward_short_wrong_answers():
     args = SimpleNamespace(reward_key=None, rewards_normalization=True, grpo_std_normalization=True)
     raw, advantages = normalize_turn_rewards(args, samples)
     assert raw == [-0.01, 0.0]
-    assert advantages == [0.0, 0.0]
+    values = torch.tensor(raw, dtype=torch.float32)
+    expected = (values - values.mean()) / (values.std(unbiased=True) + 1e-6)
+    assert advantages == pytest.approx(expected.tolist())
+
+    # Equal rewards still give no policy-gradient signal after centering.
+    same_rewards = [Sample(group_index=1, rollout_id=i, reward=0.0) for i in range(8)]
+    _, same_advantages = normalize_turn_rewards(args, same_rewards)
+    assert same_advantages == [0.0] * 8
+
+
+def test_dynamic_filter_uses_terminal_episode_reward_across_trajectories():
+    args = SimpleNamespace(n_samples_per_prompt=8)
+
+    def group(outcomes):
+        return [
+            [Sample(reward=0.0, metadata={"episode_reward": outcome}),
+             Sample(reward=outcome - 0.01, metadata={"episode_reward": outcome})]
+            for outcome in outcomes
+        ]
+
+    assert not keep_mixed_outcomes(args, group([0.0] * 8)).keep
+    assert not keep_mixed_outcomes(args, group([1.0] * 8)).keep
+    assert keep_mixed_outcomes(args, group([0.0] * 7 + [1.0])).keep
+    with pytest.raises(ValueError, match="terminal episode_reward"):
+        keep_mixed_outcomes(args, [[Sample(metadata={})] for _ in range(8)])

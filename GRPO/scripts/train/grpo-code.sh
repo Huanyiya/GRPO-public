@@ -15,7 +15,7 @@ set -euo pipefail
 # torch_memory_saver is incompatible with expandable-segments allocation.
 unset PYTORCH_CUDA_ALLOC_CONF
 
-MODEL_SIZE=${MODEL_SIZE:-2B}
+MODEL_SIZE=${MODEL_SIZE:-4B}
 TASK_NAME=${TASK_NAME:-code}
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/common.sh"
 # Resolve relative user paths the same way train.py will, from the repo root.
@@ -28,6 +28,11 @@ INIT_CKPT=${GRPO_CLI_LAST_VALUE[--ref-load]:-${INIT_CKPT:-${MODEL_ROOT}/${MODEL_
 BASE_SAVE_DIR=${SAVE_DIR:-${CHECKPOINT_ROOT}/${TASK_NAME}/${MODEL_NAME}-GRPO}
 LOAD_DIR=${GRPO_CLI_LAST_VALUE[--load]:-${LOAD_DIR:-${BASE_SAVE_DIR}}}
 SAVE_DIR=${GRPO_CLI_LAST_VALUE[--save]:-${BASE_SAVE_DIR}}
+SGLANG_CONFIG_PATH=${SAVE_DIR}/sglang-text-only.yaml
+# Triton kernels are compiled by Ray's SGLang workers. Keep their cache on
+# node-local storage so a stale handle on a shared filesystem cannot abort a
+# scheduler while it reads a compiled kernel.
+TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-/tmp/grpo-code-triton-${UID}}
 # Set SAVE_OUTPUTS=true to save one human-readable JSONL file per training
 # rollout. Each line records the generated code, every testcase actually run,
 # its SandboxFusion result, and the final binary reward.
@@ -77,10 +82,10 @@ LR=${LR:-1e-6}
 UPDATE_WEIGHT_DISK_DIR=${UPDATE_WEIGHT_DISK_DIR:-${SAVE_DIR}/weight-sync}
 
 
-WANDB_DIR=${GRPO_CLI_LAST_VALUE[--wandb-dir]:-${WANDB_DIR:-${LOG_ROOT}/${TASK_NAME}/${MODEL_NAME}/wandb}}
-# Leave this empty to use an existing `wandb login` session, or provide the
-# key at launch with WANDB_KEY=... .  Do not commit a personal API key here.
-WANDB_KEY=${WANDB_KEY:-}
+SWANLAB_DIR=${SWANLAB_DIR:-${LOG_ROOT}/${TASK_NAME}/${MODEL_NAME}/swanlab}
+# Leave this empty to use the existing SwanLab session, or provide the key at
+# launch with SWANLAB_KEY=... . Do not commit a personal API key here.
+SWANLAB_KEY=${SWANLAB_KEY:-}
 
 # Code rewards are executed by the remote SandboxFusion service.  Do not fall
 # back to executing untrusted model output on this training node.
@@ -145,7 +150,13 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY ftp_prox
 export no_proxy="localhost,127.0.0.1,0.0.0.0,${MASTER_ADDR}"
 export NO_PROXY="${no_proxy}"
 if [[ "${GRPO_DRY_RUN}" != true ]]; then
-  mkdir -p "${WANDB_DIR}"
+  mkdir -p "${TRITON_CACHE_DIR}"
+  if [[ "$(df -Pk "${TRITON_CACHE_DIR}" | awk 'NR==2 {print $4}')" -lt 8388608 ]]; then
+    echo "At least 8 GiB of free local cache space is required for Triton: ${TRITON_CACHE_DIR}" >&2
+    exit 1
+  fi
+  export TRITON_CACHE_DIR
+  mkdir -p "${SWANLAB_DIR}"
 fi
 
 NVLINK_COUNT=0
@@ -178,7 +189,7 @@ ROLLOUT_ARGS=(
   --apply-chat-template-kwargs '{"enable_thinking": false}'
   --rollout-shuffle
 
-  --num-rollout 187
+  --num-rollout 100
   --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
   --n-samples-per-prompt 8
   --num-steps-per-rollout 1
@@ -239,17 +250,17 @@ OPTIMIZER_ARGS=(
   --override-opt-param-scheduler
 )
 
-WANDB_ARGS=(
-  --use-wandb
-  --wandb-mode online
-  --wandb-project "GRPO-${TASK_NAME}-${MODEL_NAME}"
-  --wandb-group "${TRAIN_DATASET}-${TASK_NAME}-${MODEL_NAME}-nonthinking"
-  --wandb-dir "${WANDB_DIR}"
+SWANLAB_ARGS=(
+  --use-swanlab
+  --swanlab-mode "${SWANLAB_MODE:-online}"
+  --swanlab-project "GRPO-${TASK_NAME}-${MODEL_NAME}"
+  --swanlab-group "${TRAIN_DATASET}-${TASK_NAME}-${MODEL_NAME}-nonthinking"
+  --swanlab-dir "${SWANLAB_DIR}"
   --log-passrate
 )
 
-if [[ -n "${WANDB_KEY}" ]]; then
-  WANDB_ARGS+=(--wandb-key "${WANDB_KEY}")
+if [[ -n "${SWANLAB_KEY}" ]]; then
+  SWANLAB_ARGS+=(--swanlab-key "${SWANLAB_KEY}")
 fi
 
 PERF_ARGS=(
@@ -263,20 +274,34 @@ PERF_ARGS=(
   --expert-model-parallel-size 1
   --expert-tensor-parallel-size 1
 
-  --recompute-granularity full
-  --recompute-method uniform
-  --recompute-num-layers 1
+
 
   # Dynamic token batching replaces an infeasible physical micro-batch of
   # 128 sequences. With CP=2, a full 18,432-token sample spans two GPUs.
   --use-dynamic-batch-size
-  --max-tokens-per-gpu 6144
+  --max-tokens-per-gpu 4096
   --calculate-per-token-loss
   --log-probs-chunk-size 1024
   # 加到 PERF_ARGS
 )
 
+if [[ "${GRPO_DRY_RUN}" != true ]]; then
+  mkdir -p "${SAVE_DIR}"
+
+  cat > "${SGLANG_CONFIG_PATH}" <<EOF
+sglang:
+  - name: default
+    server_groups:
+      - worker_type: regular
+        num_gpus: ${NUM_GPUS}
+        num_gpus_per_engine: 1
+        overrides:
+          enable_multimodal: false
+EOF
+fi
+
 SGLANG_ARGS=(
+  --sglang-config "${SGLANG_CONFIG_PATH}"
   --rollout-num-gpus-per-engine 1
   --sglang-context-length 18432
   --sglang-server-concurrency 64
@@ -310,7 +335,7 @@ DEFAULT_TRAIN_ARGS=(
   "${GRPO_ARGS[@]}"
   "${WEIGHT_SYNC_ARGS[@]}"
   "${OPTIMIZER_ARGS[@]}"
-  "${WANDB_ARGS[@]}"
+  "${SWANLAB_ARGS[@]}"
   "${PERF_ARGS[@]}"
   "${SGLANG_ARGS[@]}"
   "${MISC_ARGS[@]}"
@@ -354,9 +379,9 @@ echo "SandboxFusion preflight passed."
   --dashboard-port "${RAY_DASHBOARD_PORT}"
 
 RUNTIME_ENV_JSON=$(printf \
-  '{"env_vars":{"PYTHONPATH":"%s:%s","CUDA_DEVICE_MAX_CONNECTIONS":"1","NCCL_NVLS_ENABLE":"%s","GLOO_SOCKET_IFNAME":"%s","TP_SOCKET_IFNAME":"%s","MASTER_ADDR":"%s","MASTER_PORT":"%s","RAY_DISABLE_DASHBOARD_GPU_METRICS":"1","SLIME_RELOAD_PROCESS_GROUPS":"0","SGLANG_HEALTH_CHECK_TIMEOUT":"%s","SGLANG_WARMUP_TIMEOUT":"%s","no_proxy":"%s","NO_PROXY":"%s","SANDBOX_FUSION_URL":"%s","CODE_SANDBOX_MAX_CONCURRENT":"%s","CODE_COMPILE_TIMEOUT":"%s","CODE_RUN_TIMEOUT":"%s","CODE_MEMORY_LIMIT_MB":"%s","SAVE_OUTPUTS":"%s"}}' \
+  '{"env_vars":{"PYTHONPATH":"%s:%s","CUDA_DEVICE_MAX_CONNECTIONS":"1","NCCL_NVLS_ENABLE":"%s","GLOO_SOCKET_IFNAME":"%s","TP_SOCKET_IFNAME":"%s","MASTER_ADDR":"%s","MASTER_PORT":"%s","RAY_DISABLE_DASHBOARD_GPU_METRICS":"1","SLIME_RELOAD_PROCESS_GROUPS":"0","SGLANG_HEALTH_CHECK_TIMEOUT":"%s","SGLANG_WARMUP_TIMEOUT":"%s","TRITON_CACHE_DIR":"%s","no_proxy":"%s","NO_PROXY":"%s","SANDBOX_FUSION_URL":"%s","CODE_SANDBOX_MAX_CONCURRENT":"%s","CODE_COMPILE_TIMEOUT":"%s","CODE_RUN_TIMEOUT":"%s","CODE_MEMORY_LIMIT_MB":"%s","SAVE_OUTPUTS":"%s"}}' \
   "${REPO_ROOT}" "${MEGATRON_PATH}" "${HAS_NVLINK}" "${SOCKET_IFNAME}" "${SOCKET_IFNAME}" \
-  "${MASTER_ADDR}" "${MASTER_PORT}" "${SGLANG_HEALTH_CHECK_TIMEOUT}" "${SGLANG_WARMUP_TIMEOUT}" "${no_proxy}" "${NO_PROXY}" \
+  "${MASTER_ADDR}" "${MASTER_PORT}" "${SGLANG_HEALTH_CHECK_TIMEOUT}" "${SGLANG_WARMUP_TIMEOUT}" "${TRITON_CACHE_DIR}" "${no_proxy}" "${NO_PROXY}" \
   "${SANDBOX_FUSION_URL}" "${CODE_SANDBOX_MAX_CONCURRENT}" \
   "${CODE_COMPILE_TIMEOUT}" "${CODE_RUN_TIMEOUT}" "${CODE_MEMORY_LIMIT_MB}" "${SAVE_OUTPUTS}")
 

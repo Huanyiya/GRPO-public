@@ -24,6 +24,7 @@ Prior to this step, you have already taken {step_count} step(s). Below is the in
 Now it's your turn to respond for the current step.
 You should first conduct reasoning process. This process MUST be enclosed within <think> </think> tags. 
 After completing your reasoning, choose only one of the following actions (do not perform both):
+You MUST NOT generate both <search> and <answer> in the same response. Once you complete one action, stop generating immediately.
 (1) If you find you lack some knowledge, you can call a search engine to get more external information using format: <search> your query </search>.
 (2) If you have enough knowledge to answer the question confidently, provide your final answer within <answer> </answer> tags, without detailed illustrations. For example, <answer>Beijing</answer>.
 """

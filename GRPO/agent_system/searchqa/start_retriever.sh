@@ -10,6 +10,7 @@ DATA_ROOT=${DATA_ROOT:-${PROJECT_ROOT}/data}
 SEARCH_ASSET_ROOT=${SEARCH_ASSET_ROOT:-${DATA_ROOT}/searchR1}
 RETRIEVER_MODEL=${RETRIEVER_MODEL:-${PROJECT_ROOT}/models/e5-base-v2}
 PYTHON_BIN=${PYTHON_BIN:-python}
+SEARCH_RETRIEVER_LOG=${SEARCH_RETRIEVER_LOG:-${PROJECT_ROOT}/logs/searchqa/retriever-server.log}
 
 for required_path in \
   "${SEARCH_ASSET_ROOT}/e5_Flat.index" \
@@ -29,5 +30,6 @@ exec "${PYTHON_BIN}" "${REPO_ROOT}/examples/search-r1/local_dense_retriever/retr
   --corpus_path "${SEARCH_ASSET_ROOT}/wiki-18.jsonl" \
   --retriever_name e5 \
   --retriever_model "${RETRIEVER_MODEL}" \
+  --metrics_log "${SEARCH_RETRIEVER_LOG}" \
   --topk 3 \
   "${EXTRA_ARGS[@]}"

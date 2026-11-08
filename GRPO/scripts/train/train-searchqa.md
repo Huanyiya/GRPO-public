@@ -11,9 +11,11 @@ python examples/search/retriever/retrieval_server.py \
   --retriever_model /mnt/cpfs/users/wxh/github-source/models/e5-base-v2 \
   --retriever_name e5 \
   --topk 3 \
-  --port 8000
+  --port 8000 \
+  --metrics_log /mnt/cpfs/users/wxh/github-source/logs/searchqa/retriever-server.log
 
 
 SEARCH_URL=http://127.0.0.1:8000/retrieve \
 SEARCH_API_STYLE=single \
-bash /mnt/cpfs/users/wxh/github-source/GRPO/scripts/train/run-grpo-searchqa.sh
+SEARCH_MAX_CONCURRENCY=64 \
+bash /mnt/cpfs/users/wxh/github-source/GRPO/scripts/train/run-grpo-searchqa.sh --seed 2026 --rollout-seed 2026

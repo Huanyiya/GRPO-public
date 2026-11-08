@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Convert every ALFWorld Qwen3.5-2B GRPO torch_dist checkpoint to Hugging Face.
+# Convert every complete Qwen3.5-2B GRPO torch_dist checkpoint to Hugging Face.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 PROJECT_ROOT="$(cd -- "${REPO_ROOT}/.." && pwd)"
+TASK="alfworld"
 
-CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-${PROJECT_ROOT}/checkpoints/webshop/Qwen3.5-2B-GRPO}"
-BASE_MODEL_DIR="${BASE_MODEL_DIR:-${PROJECT_ROOT}/models/Qwen3.5-2B}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_ROOT}/checkpoints_hf/webshop/Qwen3.5-2B-GRPO}"
+CHECKPOINT_ROOT="${CHECKPOINT_ROOT:-${PROJECT_ROOT}/checkpoints/${TASK}/Qwen3.5-4B-GRPO}"
+BASE_MODEL_DIR="${BASE_MODEL_DIR:-${PROJECT_ROOT}/models/Qwen3.5-4B}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_ROOT}/checkpoints_hf/${TASK}/Qwen3.5-4B-GRPO}"
 MEGATRON_PATH="${MEGATRON_PATH:-${PROJECT_ROOT}/Megatron-LM}"
 PYTHON_BIN="/mnt/cpfs/users/wxh/slime-OPD/.venv/bin/python"
 if [[ ! -x "${PYTHON_BIN}" ]]; then
@@ -48,7 +49,7 @@ print(vocab_size)
 PY
 )"
 
-mkdir -p "${PROJECT_ROOT}/checkpoints_hf/alfworld" "${OUTPUT_ROOT}"
+mkdir -p "${OUTPUT_ROOT}"
 
 validate_output() {
     local output_dir=$1
@@ -78,24 +79,28 @@ print(f"Validated {len(weight_map)} model tensors in {len(set(weight_map.values(
 PY
 }
 
-mapfile -d '' CHECKPOINT_DIRS < <(
-    find "${CHECKPOINT_ROOT}" -mindepth 1 -maxdepth 1 -type d -name 'iter_*' -print0 | sort -z
+mapfile -t CHECKPOINT_DIRS < <(
+    find "${CHECKPOINT_ROOT}" -mindepth 1 -maxdepth 1 -type d -name 'iter_[0-9][0-9][0-9][0-9][0-9][0-9][0-9]' -print \
+        | LC_ALL=C sort
 )
 if [[ ${#CHECKPOINT_DIRS[@]} -eq 0 ]]; then
-    echo "No iter_* checkpoint directories found in ${CHECKPOINT_ROOT}" >&2
+    echo "No iter_XXXXXXX checkpoints found in ${CHECKPOINT_ROOT}" >&2
     exit 1
 fi
+
+for CHECKPOINT_DIR in "${CHECKPOINT_DIRS[@]}"; do
+    if [[ ! -f "${CHECKPOINT_DIR}/.metadata" || ! -f "${CHECKPOINT_DIR}/common.pt" ]]; then
+        echo "Incomplete torch_dist checkpoint: ${CHECKPOINT_DIR}" >&2
+        exit 1
+    fi
+done
 
 echo "Base model: ${BASE_MODEL_DIR}"
 echo "Checkpoint root: ${CHECKPOINT_ROOT}"
 echo "Output root: ${OUTPUT_ROOT}"
+echo "Found ${#CHECKPOINT_DIRS[@]} checkpoints to convert"
 
 for CHECKPOINT_DIR in "${CHECKPOINT_DIRS[@]}"; do
-    if [[ ! -f "${CHECKPOINT_DIR}/.metadata" || ! -f "${CHECKPOINT_DIR}/common.pt" ]]; then
-        echo "Skipping incomplete torch_dist checkpoint: ${CHECKPOINT_DIR}" >&2
-        continue
-    fi
-
     CHECKPOINT_NAME=$(basename -- "${CHECKPOINT_DIR}")
     OUTPUT_DIR="${OUTPUT_ROOT}/${CHECKPOINT_NAME}"
     if [[ -e "${OUTPUT_DIR}" ]]; then

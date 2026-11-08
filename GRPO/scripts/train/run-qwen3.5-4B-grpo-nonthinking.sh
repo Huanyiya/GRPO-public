@@ -80,7 +80,7 @@ WEIGHT_SYNC_TRANSPORT=${WEIGHT_SYNC_TRANSPORT:-disk}
 UPDATE_WEIGHT_DISK_DIR=${UPDATE_WEIGHT_DISK_DIR:-${SAVE_DIR}/weight-sync}
 
 
-WANDB_DIR=${WANDB_DIR:-${SAVE_DIR}/wandb}
+SWANLAB_DIR=${SWANLAB_DIR:-${SAVE_DIR}/swanlab}
 
 MODEL_CONFIG="${REPO_ROOT}/scripts/models/qwen3.5-${MODEL_SIZE}.sh"
 if [[ ! -f "${MODEL_CONFIG}" ]]; then
@@ -131,7 +131,7 @@ mkdir -p \
   "${TRITON_CACHE_DIR}" \
   "${TORCH_EXTENSIONS_DIR}" \
   "${XDG_CACHE_HOME}" \
-  "${WANDB_DIR}"
+  "${SWANLAB_DIR}"
 
 NVLINK_COUNT=0
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -234,14 +234,16 @@ OPTIMIZER_ARGS=(
   --override-opt-param-scheduler
 )
 
-WANDB_ARGS=(
-  --use-wandb
-  --wandb-mode online
-  --wandb-project "GRPO-${TASK_NAME}-${MODEL_NAME}"
-  --wandb-group "${TRAIN_DATASET}-${TASK_NAME}-${MODEL_NAME}-nonthinking"
-  --wandb-dir "${WANDB_DIR}"
+SWANLAB_ARGS=(
+  --use-swanlab
+  --swanlab-mode "${SWANLAB_MODE:-online}"
+  --swanlab-project "GRPO-${TASK_NAME}-${MODEL_NAME}"
+  --swanlab-group "${TRAIN_DATASET}-${TASK_NAME}-${MODEL_NAME}-nonthinking"
+  --swanlab-dir "${SWANLAB_DIR}"
   --log-passrate
 )
+if [[ -n "${SWANLAB_KEY:-}" ]]; then SWANLAB_ARGS+=(--swanlab-key "${SWANLAB_KEY}"); fi
+if [[ -n "${SWANLAB_WORKSPACE:-}" ]]; then SWANLAB_ARGS+=(--swanlab-workspace "${SWANLAB_WORKSPACE}"); fi
 
 PERF_ARGS=(
   --tensor-model-parallel-size 2
@@ -324,7 +326,7 @@ RUNTIME_ENV_JSON=$(printf \
   "${GRPO_ARGS[@]}" \
   "${WEIGHT_SYNC_ARGS[@]}" \
   "${OPTIMIZER_ARGS[@]}" \
-  "${WANDB_ARGS[@]}" \
+  "${SWANLAB_ARGS[@]}" \
   "${PERF_ARGS[@]}" \
   "${SGLANG_ARGS[@]}" \
   "${MISC_ARGS[@]}"

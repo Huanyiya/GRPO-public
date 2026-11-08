@@ -27,11 +27,6 @@ def normalize_turn_rewards(args, samples: list[Sample]) -> tuple[list[float], li
 
     advantages = [0.0] * len(samples)
     for positions in groups.values():
-        # Invalid-action penalties can distinguish failures, but a valid wrong
-        # answer must not become a positive training example when every
-        # trajectory for this question failed.
-        if not any(samples[position].metadata.get("episode_won", False) for position in positions):
-            continue
         values = torch.tensor([raw_rewards[position] for position in positions], dtype=torch.float32)
         centered = values - values.mean()
         if args.grpo_std_normalization and len(positions) > 1:

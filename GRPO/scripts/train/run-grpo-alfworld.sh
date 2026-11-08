@@ -5,10 +5,10 @@
 
 set -euo pipefail
 unset PYTORCH_CUDA_ALLOC_CONF
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-NUM_GPUS=4
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+NUM_GPUS=8
 
-MODEL_SIZE=${MODEL_SIZE:-2B}
+MODEL_SIZE=${MODEL_SIZE:-4B}
 TASK_NAME=alfworld
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/common.sh"
 cd "${REPO_ROOT}"
@@ -22,11 +22,11 @@ export ALFWORLD_DATA
 MODEL_DIR=${GRPO_CLI_LAST_VALUE[--hf-checkpoint]:-${MODEL_DIR:-${MODEL_PATH}}}
 INIT_CKPT=${GRPO_CLI_LAST_VALUE[--ref-load]:-${INIT_CKPT:-${MODEL_ROOT}/${MODEL_NAME}_torch_dist}}
 BASE_SAVE_DIR=${SAVE_DIR:-${CHECKPOINT_ROOT}/${TASK_NAME}/${MODEL_NAME}-GRPO}
-LOAD_DIR=${GRPO_CLI_LAST_VALUE[--load]:-${LOAD_DIR:-${BASE_SAVE_DIR}}}
+# Resume the full GRPO training state (model, optimizer, and progress) from
+# the specified ALFWorld checkpoint.
+LOAD_DIR=/mnt/cpfs/users/wxh/github-source/checkpoints/alfworld/Qwen3.5-4B-GRPO
 SAVE_DIR=${GRPO_CLI_LAST_VALUE[--save]:-${BASE_SAVE_DIR}}
-RESUME_ITERATION=19
-WANDB_RUN_ID=${WANDB_RUN_ID:-v938e9bt}
-WANDB_DIR=${GRPO_CLI_LAST_VALUE[--wandb-dir]:-${WANDB_DIR:-${LOG_ROOT}/${TASK_NAME}/${MODEL_NAME}/wandb}}
+SWANLAB_DIR=${SWANLAB_DIR:-${LOG_ROOT}/${TASK_NAME}/${MODEL_NAME}/swanlab}
 UPDATE_WEIGHT_DISK_DIR=${UPDATE_WEIGHT_DISK_DIR:-${SAVE_DIR}/weight-sync}
 # Ray and SGLang create Unix sockets below their temporary directories.
 # Keep these short and on a local filesystem, as in the OPD launch scripts.
@@ -36,6 +36,7 @@ RAY_LOG_ARCHIVE_DIR=${RAY_LOG_ARCHIVE_DIR:-${LOG_ROOT}/ray}
 DEFAULT_WORKER_TMP_DIR=/dev/shm/alfworld-tmp-$$
 WORKER_TMP_DIR=${WORKER_TMP_DIR:-${DEFAULT_WORKER_TMP_DIR}}
 SGLANG_CONFIG_PATH=${WORKER_TMP_DIR}/sglang-text-only.yaml
+TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-/tmp/grpo-alfworld-triton-${UID}}
 DATA_PATH=
 EVAL_DATA_PATH=
 
@@ -57,10 +58,12 @@ export no_proxy="localhost,127.0.0.1,0.0.0.0,${MASTER_ADDR}"
 export NO_PROXY="${no_proxy}"
 
 if [[ "${GRPO_DRY_RUN}" != true ]]; then
-  if [[ "$(cat "${LOAD_DIR}/latest_checkpointed_iteration.txt" 2>/dev/null || true)" != "${RESUME_ITERATION}" || ! -f "${LOAD_DIR}/iter_0000019/.metadata" || ! -f "${LOAD_DIR}/rollout/alfworld_data_source_19.pt" ]]; then
-    echo "Expected model iteration 19 and ALFWorld data state under ${LOAD_DIR}" >&2
+  mkdir -p "${TRITON_CACHE_DIR}"
+  if [[ "$(df -Pk "${TRITON_CACHE_DIR}" | awk 'NR==2 {print $4}')" -lt 8388608 ]]; then
+    echo "At least 8 GiB of free cache space is required for Triton: ${TRITON_CACHE_DIR}" >&2
     exit 1
   fi
+  export TRITON_CACHE_DIR
   # Match the asset checks in SDA's prepare_alfworld.sh. The text environment
   # selects solvable game.tw-pddl files from the train split at runtime.
   for required_path in \
@@ -86,7 +89,7 @@ if [[ "${GRPO_DRY_RUN}" != true ]]; then
     fi
   done
   PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}" "${PYTHON_BIN}" -c 'import alfworld, textworld, yaml'
-  mkdir -p "${WANDB_DIR}" "${RAY_TMP_DIR}" "${RAY_LOG_ARCHIVE_DIR}" "${WORKER_TMP_DIR}"
+  mkdir -p "${SWANLAB_DIR}" "${RAY_TMP_DIR}" "${RAY_LOG_ARCHIVE_DIR}" "${WORKER_TMP_DIR}"
   # ALFWorld uses text only. Skip SGLang's multimodal processor, whose Qwen
   # module cannot import against the installed Transformers version.
   cat > "${SGLANG_CONFIG_PATH}" <<EOF
@@ -119,6 +122,7 @@ ROLLOUT_ARGS=(
   --data-source-path slime_plugins.alfworld.data_source.AlfWorldDataSource
   --custom-generate-function-path slime_plugins.alfworld.rollout.generate
   --custom-reward-post-process-path slime_plugins.alfworld.rewards.normalize_step_rewards
+  --custom-rollout-log-function-path slime_plugins.alfworld.metrics.log_train_accuracy
   --apply-chat-template-kwargs '{"enable_thinking": false}'
   --num-rollout 100
   --rollout-batch-size 16
@@ -164,14 +168,15 @@ OPTIMIZER_ARGS=(
   --override-opt-param-scheduler
 )
 
-WANDB_ARGS=(
-  --use-wandb
-  --wandb-mode online
-  --wandb-run-id "${WANDB_RUN_ID}"
-  --wandb-dir "${WANDB_DIR}"
-  --wandb-project "GRPO-${TASK_NAME}-${MODEL_NAME}"
-  --wandb-group "${TASK_NAME}-${MODEL_NAME}-nonthinking"
+SWANLAB_ARGS=(
+  --use-swanlab
+  --swanlab-mode "${SWANLAB_MODE:-online}"
+  --swanlab-dir "${SWANLAB_DIR}"
+  --swanlab-project "GRPO-${TASK_NAME}-${MODEL_NAME}"
+  --swanlab-group "${TASK_NAME}-${MODEL_NAME}-nonthinking"
 )
+if [[ -n "${SWANLAB_KEY:-}" ]]; then SWANLAB_ARGS+=(--swanlab-key "${SWANLAB_KEY}"); fi
+if [[ -n "${SWANLAB_WORKSPACE:-}" ]]; then SWANLAB_ARGS+=(--swanlab-workspace "${SWANLAB_WORKSPACE}"); fi
 
 PERF_ARGS=(
   --log-grpo-step-timing
@@ -223,7 +228,7 @@ DEFAULT_TRAIN_ARGS=(
   "${GRPO_ARGS[@]}"
   "${WEIGHT_SYNC_ARGS[@]}"
   "${OPTIMIZER_ARGS[@]}"
-  "${WANDB_ARGS[@]}"
+  "${SWANLAB_ARGS[@]}"
   "${PERF_ARGS[@]}"
   "${SGLANG_ARGS[@]}"
   "${MISC_ARGS[@]}"
@@ -268,8 +273,8 @@ archive_ray_logs() {
 trap archive_ray_logs EXIT
 
 RUNTIME_ENV_JSON=$(printf \
-  '{"env_vars":{"PYTHONPATH":"%s:%s","ALFWORLD_DATA":"%s","TMPDIR":"%s","TMP":"%s","TEMP":"%s","CUDA_DEVICE_MAX_CONNECTIONS":"1","NCCL_NVLS_ENABLE":"%s","GLOO_SOCKET_IFNAME":"%s","TP_SOCKET_IFNAME":"%s","MASTER_ADDR":"%s","MASTER_PORT":"%s","RAY_DISABLE_DASHBOARD_GPU_METRICS":"1","SLIME_RELOAD_PROCESS_GROUPS":"0","SGLANG_HEALTH_CHECK_TIMEOUT":"%s","SGLANG_WARMUP_TIMEOUT":"%s","no_proxy":"%s","NO_PROXY":"%s"}}' \
-  "${REPO_ROOT}" "${MEGATRON_PATH}" "${ALFWORLD_DATA}" "${WORKER_TMP_DIR}" "${WORKER_TMP_DIR}" "${WORKER_TMP_DIR}" "${HAS_NVLINK}" "${SOCKET_IFNAME}" "${SOCKET_IFNAME}" \
+  '{"env_vars":{"PYTHONPATH":"%s:%s","ALFWORLD_DATA":"%s","TMPDIR":"%s","TMP":"%s","TEMP":"%s","TRITON_CACHE_DIR":"%s","CUDA_DEVICE_MAX_CONNECTIONS":"1","NCCL_NVLS_ENABLE":"%s","GLOO_SOCKET_IFNAME":"%s","TP_SOCKET_IFNAME":"%s","MASTER_ADDR":"%s","MASTER_PORT":"%s","RAY_DISABLE_DASHBOARD_GPU_METRICS":"1","SLIME_RELOAD_PROCESS_GROUPS":"0","SGLANG_HEALTH_CHECK_TIMEOUT":"%s","SGLANG_WARMUP_TIMEOUT":"%s","no_proxy":"%s","NO_PROXY":"%s"}}' \
+  "${REPO_ROOT}" "${MEGATRON_PATH}" "${ALFWORLD_DATA}" "${WORKER_TMP_DIR}" "${WORKER_TMP_DIR}" "${WORKER_TMP_DIR}" "${TRITON_CACHE_DIR}" "${HAS_NVLINK}" "${SOCKET_IFNAME}" "${SOCKET_IFNAME}" \
   "${MASTER_ADDR}" "${MASTER_PORT}" "${SGLANG_HEALTH_CHECK_TIMEOUT}" "${SGLANG_WARMUP_TIMEOUT}" "${no_proxy}" "${NO_PROXY}")
 
 "${RAY_BIN}" job submit \

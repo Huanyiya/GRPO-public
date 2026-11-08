@@ -433,6 +433,13 @@ async def generate_rollout_async(
             ):
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
                 state.remaining_batch_size -= 1
+                max_groups = getattr(args, "dynamic_sampling_max_groups", None)
+                if max_groups is not None and len(all_data) >= max_groups:
+                    raise RuntimeError(
+                        f"Dynamic sampling accepted {len(data)}/{target_data_size} groups "
+                        f"after {len(all_data)} candidates; increase --dynamic-sampling-max-groups "
+                        "or inspect reward diversity."
+                    )
                 continue
 
             # add the samples to the data

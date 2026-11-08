@@ -12,7 +12,7 @@ unset PYTORCH_CUDA_ALLOC_CONF
 export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
 export JVM_PATH="$JAVA_HOME/lib/server/libjvm.so"
 export PATH="$JAVA_HOME/bin:$PATH"
-MODEL_SIZE=${MODEL_SIZE:-2B}
+MODEL_SIZE=${MODEL_SIZE:-4B}
 TASK_NAME=webshop
 NUM_GPUS=${NUM_GPUS:-8}
 
@@ -32,7 +32,7 @@ SAVE_DIR=${GRPO_CLI_LAST_VALUE[--save]:-${SAVE_DIR:-${CHECKPOINT_ROOT}/${TASK_NA
 LOAD_DIR=${GRPO_CLI_LAST_VALUE[--load]:-${LOAD_DIR:-${SAVE_DIR}}}
 DATA_PATH=
 EVAL_DATA_PATH=
-WANDB_DIR=${GRPO_CLI_LAST_VALUE[--wandb-dir]:-${WANDB_DIR:-${LOG_ROOT}/${TASK_NAME}/${MODEL_NAME}/wandb}}
+SWANLAB_DIR=${SWANLAB_DIR:-${LOG_ROOT}/${TASK_NAME}/${MODEL_NAME}/swanlab}
 DEFAULT_RAY_TMP_DIR=/tmp/ray-webshop-$$
 RAY_TMP_DIR=${RAY_TMP_DIR:-${DEFAULT_RAY_TMP_DIR}}
 DEFAULT_WORKER_TMP_DIR=/tmp/webshop-worker-$$
@@ -69,7 +69,7 @@ if [[ "${GRPO_DRY_RUN}" != true ]]; then
   done
   PYTHONPATH="${REPO_ROOT}:${WEBSHOP_ROOT}:${PYTHONPATH:-}" "${PYTHON_BIN}" -c \
     'import gym, pyserini, spacy, slime; spacy.load("en_core_web_sm")'
-  mkdir -p "${WANDB_DIR}" "${RAY_TMP_DIR}" "${RAY_LOG_ARCHIVE_DIR}" "${WORKER_TMP_DIR}"
+  mkdir -p "${SWANLAB_DIR}" "${RAY_TMP_DIR}" "${RAY_LOG_ARCHIVE_DIR}" "${WORKER_TMP_DIR}"
   cat > "${SGLANG_CONFIG_PATH}" <<EOF
 sglang:
   - name: default
@@ -93,6 +93,7 @@ CKPT_ARGS=(
   --hf-checkpoint "${MODEL_DIR}"
   --ref-load "${INIT_CKPT}"
   --load "${LOAD_DIR}"
+  --ckpt-step 9
   --save "${SAVE_DIR}"
   --save-interval 10
 )
@@ -149,13 +150,19 @@ OPTIMIZER_ARGS=(
   --override-opt-param-scheduler
 )
 
-WANDB_ARGS=(
-    --use-wandb
-    --wandb-mode online
-    --wandb-dir "${WANDB_DIR}"
-    --wandb-project "GRPO-${TASK_NAME}-${MODEL_NAME}"
-    --wandb-group "${TASK_NAME}-${MODEL_NAME}-nonthinking"
-  )
+SWANLAB_ARGS=(
+  --use-swanlab
+  --swanlab-mode "${SWANLAB_MODE:-online}"
+  --swanlab-dir "${SWANLAB_DIR}"
+  --swanlab-project "GRPO-${TASK_NAME}-${MODEL_NAME}"
+  --swanlab-group "${TASK_NAME}-${MODEL_NAME}-nonthinking"
+)
+if [[ -n "${SWANLAB_KEY:-}" ]]; then
+  SWANLAB_ARGS+=(--swanlab-key "${SWANLAB_KEY}")
+fi
+if [[ -n "${SWANLAB_WORKSPACE:-}" ]]; then
+  SWANLAB_ARGS+=(--swanlab-workspace "${SWANLAB_WORKSPACE}")
+fi
 
 
 PERF_ARGS=(
@@ -168,11 +175,8 @@ PERF_ARGS=(
   --use-distributed-optimizer
   --expert-model-parallel-size 1
   --expert-tensor-parallel-size 1
-  --recompute-granularity full
-  --recompute-method uniform
-  --recompute-num-layers 1
   --use-dynamic-batch-size
-  --max-tokens-per-gpu 8192
+  --max-tokens-per-gpu 4096
   --per-turn-loss
   --log-probs-chunk-size 1024
 )
@@ -182,7 +186,7 @@ SGLANG_ARGS=(
   --rollout-num-gpus-per-engine 1
   --sglang-context-length 4608
   --sglang-server-concurrency 64
-  --sglang-mem-fraction-static 0.7
+  --sglang-mem-fraction-static 0.5
   --sglang-mamba-scheduler-strategy extra_buffer
 )
 
@@ -208,7 +212,7 @@ DEFAULT_TRAIN_ARGS=(
   "${GRPO_ARGS[@]}"
   "${WEIGHT_SYNC_ARGS[@]}"
   "${OPTIMIZER_ARGS[@]}"
-  "${WANDB_ARGS[@]}"
+  "${SWANLAB_ARGS[@]}"
   "${PERF_ARGS[@]}"
   "${SGLANG_ARGS[@]}"
   "${MISC_ARGS[@]}"
@@ -255,6 +259,9 @@ keys = ("WEBSHOP_ROOT", "WEBSHOP_DATA", "TMPDIR", "TMP", "TEMP",
         "MASTER_ADDR", "MASTER_PORT", "SGLANG_HEALTH_CHECK_TIMEOUT",
         "SGLANG_WARMUP_TIMEOUT", "no_proxy", "NO_PROXY")
 values = {key: os.environ[key] for key in keys}
+for key in ("SWANLAB_API_KEY", "SWANLAB_API_HOST"):
+    if key in os.environ:
+        values[key] = os.environ[key]
 values["PYTHONPATH"] = os.pathsep.join((os.environ["REPO_ROOT"],
                                         os.environ["WEBSHOP_ROOT"],
                                         os.environ["MEGATRON_PATH"],

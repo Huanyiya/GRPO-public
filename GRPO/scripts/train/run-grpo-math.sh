@@ -15,7 +15,7 @@ set -euo pipefail
 # torch_memory_saver is incompatible with expandable-segments allocation.
 unset PYTORCH_CUDA_ALLOC_CONF
 
-MODEL_SIZE=${MODEL_SIZE:-2B}
+MODEL_SIZE=${MODEL_SIZE:-9B}
 TASK_NAME=${TASK_NAME:-math}
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/common.sh"
 # Resolve relative user paths the same way train.py will, from the repo root.
@@ -40,7 +40,10 @@ echo "Training dataset: ${DATA_PATH} (input=prompt; label=reward_model)"
 # crash inside HGGC.  Use the OPD-proven path by default: export HF weights
 # while Megatron is resident, CPU-offload it, then reload SGLang from disk.
 UPDATE_WEIGHT_DISK_DIR=${UPDATE_WEIGHT_DISK_DIR:-${SAVE_DIR}/weight-sync}
-WANDB_DIR=${GRPO_CLI_LAST_VALUE[--wandb-dir]:-${WANDB_DIR:-${LOG_ROOT}/${TASK_NAME}/${MODEL_NAME}/wandb}}
+# This launcher needs a node-local Triton cache. Ignore an inherited
+# TRITON_CACHE_DIR from the shell; use GRPO_TRITON_CACHE_DIR to override.
+TRITON_CACHE_DIR=${GRPO_TRITON_CACHE_DIR:-/tmp/grpo-math-triton-${UID}}
+SWANLAB_DIR=${SWANLAB_DIR:-${LOG_ROOT}/${TASK_NAME}/${MODEL_NAME}/swanlab}
 
 MODEL_CONFIG="${SCRIPT_DIR}/models/qwen3.5-${MODEL_SIZE}.sh"
 if [[ ! -f "${MODEL_CONFIG}" ]]; then
@@ -51,7 +54,8 @@ source "${MODEL_CONFIG}"
 
 export PYTHONUNBUFFERED=1
 export MASTER_ADDR MASTER_PORT
-export SGLANG_HEALTH_CHECK_TIMEOUT SGLANG_WARMUP_TIMEOUT
+GRPO_SGLANG_STARTUP_TRACE_SECONDS=${GRPO_SGLANG_STARTUP_TRACE_SECONDS:-120}
+export SGLANG_HEALTH_CHECK_TIMEOUT SGLANG_WARMUP_TIMEOUT TRITON_CACHE_DIR GRPO_SGLANG_STARTUP_TRACE_SECONDS
 # HGGC's NVML does not implement nvmlDeviceGetProcessesUtilizationInfo. Ray
 # 2.55's dashboard agent otherwise exits during GPU metric collection, which
 # makes raylet exit and causes `ray start` to time out.
@@ -65,7 +69,8 @@ export no_proxy="localhost,127.0.0.1,0.0.0.0,${MASTER_ADDR}"
 export NO_PROXY="${no_proxy}"
 
 if [[ "${GRPO_DRY_RUN}" != true ]]; then
-  mkdir -p "${WANDB_DIR}"
+  mkdir -p "${SWANLAB_DIR}" "${TRITON_CACHE_DIR}"
+  echo "Triton cache: ${TRITON_CACHE_DIR} ($(df -T "${TRITON_CACHE_DIR}" | awk 'NR==2 {print $2}'))"
 fi
 
 NVLINK_COUNT=0
@@ -87,7 +92,7 @@ CKPT_ARGS=(
   --ref-load "${INIT_CKPT}"
   --load "${LOAD_DIR}"
   --save "${SAVE_DIR}"
-  --save-interval 100
+  --save-interval 10
 )
 
 ROLLOUT_ARGS=(
@@ -104,8 +109,8 @@ ROLLOUT_ARGS=(
   --num-steps-per-rollout 1
 
   --rollout-max-prompt-len 2048
-  --rollout-max-response-len 16384
-  --rollout-max-context-len 18432
+  --rollout-max-response-len 6144
+  --rollout-max-context-len 8192
   --rollout-temperature 1.0
   --rollout-top-p 1.0
   --balance-data
@@ -120,8 +125,8 @@ EVAL_ARGS=(
   --eval-label-key reward_model
   --n-samples-per-eval-prompt 8
   --eval-max-prompt-len 2048
-  --eval-max-response-len 16384
-  --eval-max-context-len 18432
+  --eval-max-response-len 6144
+  --eval-max-context-len 8192
   --eval-temperature 1.0
   --eval-top-p 0.95
   --eval-top-k 20
@@ -171,13 +176,15 @@ OPTIMIZER_ARGS=(
   --override-opt-param-scheduler
 )
 
-WANDB_ARGS=(
-  --use-wandb
-  --wandb-mode online
-  --wandb-dir "${WANDB_DIR}"
-  --wandb-project "GRPO-${TASK_NAME}-${MODEL_NAME}"
-  --wandb-group "dapo-${TASK_NAME}-${MODEL_NAME}-nonthinking"
+SWANLAB_ARGS=(
+  --use-swanlab
+  --swanlab-mode "${SWANLAB_MODE:-online}"
+  --swanlab-dir "${SWANLAB_DIR}"
+  --swanlab-project "GRPO-${TASK_NAME}-${MODEL_NAME}"
+  --swanlab-group "dapo-${TASK_NAME}-${MODEL_NAME}-nonthinking"
 )
+if [[ -n "${SWANLAB_KEY:-}" ]]; then SWANLAB_ARGS+=(--swanlab-key "${SWANLAB_KEY}"); fi
+if [[ -n "${SWANLAB_WORKSPACE:-}" ]]; then SWANLAB_ARGS+=(--swanlab-workspace "${SWANLAB_WORKSPACE}"); fi
 
 PERF_ARGS=(
   --log-grpo-step-timing
@@ -194,17 +201,17 @@ PERF_ARGS=(
   --recompute-method uniform
   --recompute-num-layers 1
 
-  # Dynamic token batching replaces an infeasible physical micro-batch of
-  # 128 sequences. With CP=2, a full 18,432-token sample spans two GPUs.
+  # Keep each CP rank at or below 4,096 tokens. The 18,432-token setting
+  # exhausted device memory in FlashAttention during the first train step.
   --use-dynamic-batch-size
-  --max-tokens-per-gpu 8192
+  --max-tokens-per-gpu 4096
   --calculate-per-token-loss
   --log-probs-chunk-size 1024
 )
 
 SGLANG_ARGS=(
   --rollout-num-gpus-per-engine 1
-  --sglang-context-length 18432
+  --sglang-context-length 8192
   --sglang-server-concurrency 64
   --sglang-mem-fraction-static 0.7
   --sglang-mamba-scheduler-strategy extra_buffer
@@ -236,7 +243,7 @@ DEFAULT_TRAIN_ARGS=(
   "${GRPO_ARGS[@]}"
   "${WEIGHT_SYNC_ARGS[@]}"
   "${OPTIMIZER_ARGS[@]}"
-  "${WANDB_ARGS[@]}"
+  "${SWANLAB_ARGS[@]}"
   "${PERF_ARGS[@]}"
   "${SGLANG_ARGS[@]}"
   "${MISC_ARGS[@]}"
@@ -259,9 +266,9 @@ fi
   --dashboard-port "${RAY_DASHBOARD_PORT}"
 
 RUNTIME_ENV_JSON=$(printf \
-  '{"env_vars":{"PYTHONPATH":"%s:%s","CUDA_DEVICE_MAX_CONNECTIONS":"1","NCCL_NVLS_ENABLE":"%s","GLOO_SOCKET_IFNAME":"%s","TP_SOCKET_IFNAME":"%s","MASTER_ADDR":"%s","MASTER_PORT":"%s","RAY_DISABLE_DASHBOARD_GPU_METRICS":"1","SLIME_RELOAD_PROCESS_GROUPS":"0","SGLANG_HEALTH_CHECK_TIMEOUT":"%s","SGLANG_WARMUP_TIMEOUT":"%s","no_proxy":"%s","NO_PROXY":"%s"}}' \
+  '{"env_vars":{"PYTHONPATH":"%s:%s","CUDA_DEVICE_MAX_CONNECTIONS":"1","NCCL_NVLS_ENABLE":"%s","GLOO_SOCKET_IFNAME":"%s","TP_SOCKET_IFNAME":"%s","MASTER_ADDR":"%s","MASTER_PORT":"%s","RAY_DISABLE_DASHBOARD_GPU_METRICS":"1","SLIME_RELOAD_PROCESS_GROUPS":"0","SGLANG_HEALTH_CHECK_TIMEOUT":"%s","SGLANG_WARMUP_TIMEOUT":"%s","TRITON_CACHE_DIR":"%s","GRPO_SGLANG_STARTUP_TRACE_SECONDS":"%s","no_proxy":"%s","NO_PROXY":"%s"}}' \
   "${REPO_ROOT}" "${MEGATRON_PATH}" "${HAS_NVLINK}" "${SOCKET_IFNAME}" "${SOCKET_IFNAME}" \
-  "${MASTER_ADDR}" "${MASTER_PORT}" "${SGLANG_HEALTH_CHECK_TIMEOUT}" "${SGLANG_WARMUP_TIMEOUT}" "${no_proxy}" "${NO_PROXY}")
+  "${MASTER_ADDR}" "${MASTER_PORT}" "${SGLANG_HEALTH_CHECK_TIMEOUT}" "${SGLANG_WARMUP_TIMEOUT}" "${TRITON_CACHE_DIR}" "${GRPO_SGLANG_STARTUP_TRACE_SECONDS}" "${no_proxy}" "${NO_PROXY}")
 
 "${RAY_BIN}" job submit \
   --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \

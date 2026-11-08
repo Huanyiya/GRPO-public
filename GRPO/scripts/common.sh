@@ -134,13 +134,13 @@ grpo_print_dry_run() {
   local i=0 token
   while ((i < ${#GRPO_TRAIN_ARGS[@]})); do
     token=${GRPO_TRAIN_ARGS[i]}
-    if [[ "${token}" == --wandb-key ]]; then
-      printf '  --wandb-key <redacted>\n'
+    if [[ "${token}" == --wandb-key || "${token}" == --swanlab-key ]]; then
+      printf '  %s <redacted>\n' "${token}"
       i=$((i + 2))
       continue
     fi
-    if [[ "${token}" == --wandb-key=* ]]; then
-      printf '  --wandb-key=<redacted>\n'
+    if [[ "${token}" == --wandb-key=* || "${token}" == --swanlab-key=* ]]; then
+      printf '  %s=<redacted>\n' "${token%%=*}"
       i=$((i + 1))
       continue
     fi

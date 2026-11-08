@@ -45,6 +45,48 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
     )
 
 
+def _launch_server_with_startup_trace(server_args: ServerArgs) -> None:
+    # A stuck SGLang child otherwise leaves only the scheduler's last log line.
+    # Dump the HTTP process Python stacks once so startup waits can be located.
+    import faulthandler
+    import json
+    import sys
+    import traceback
+    from pathlib import Path
+
+    timeout = int(os.environ["GRPO_SGLANG_STARTUP_TRACE_SECONDS"])
+    faulthandler.dump_traceback_later(timeout, repeat=False, file=sys.stderr)
+
+    try:
+        # This SGLang build imports its Qwen2.5 vision model while registering
+        # the Qwen3.5 processor. Transformers 5 removed the rotary class, so
+        # the whole processor module is otherwise skipped during discovery.
+        config_path = Path(server_args.model_path) / "config.json"
+        with config_path.open() as config_file:
+            model_type = json.load(config_file).get("model_type")
+        if model_type == "qwen3_5":
+            from transformers.models.qwen2_5_vl import modeling_qwen2_5_vl
+
+            if not hasattr(modeling_qwen2_5_vl, "Qwen2_5_VisionRotaryEmbedding"):
+                class Qwen2_5_VisionRotaryEmbedding:
+                    def __init__(self, *args, **kwargs):
+                        raise RuntimeError("Qwen2.5 vision rotary embedding is unavailable in this Transformers version")
+
+                modeling_qwen2_5_vl.Qwen2_5_VisionRotaryEmbedding = Qwen2_5_VisionRotaryEmbedding
+
+        from sglang.srt.entrypoints.http_server import launch_server
+        launch_server(server_args)
+    except BaseException:
+        # multiprocessing prints uncaught exceptions only after joining child
+        # processes; SGLang's scheduler can run forever and hide the cause.
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        os._exit(1)
+    # The HTTP server should run for the lifetime of the rollout engine.
+    print("SGLang HTTP server exited during startup", file=sys.stderr, flush=True)
+    os._exit(1)
+
+
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     # Expandable segments help the colocated training actor tolerate repeated
     # cache releases, but SGLang's allocator/sleep path does not support them.
@@ -66,7 +108,12 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
 
     multiprocessing.set_start_method("spawn", force=True)
     server_args.host = server_args.host.strip("[]")
-    p = multiprocessing.Process(target=launch_server, args=(server_args,))
+    target = (
+        _launch_server_with_startup_trace
+        if os.environ.get("GRPO_SGLANG_STARTUP_TRACE_SECONDS")
+        else launch_server
+    )
+    p = multiprocessing.Process(target=target, args=(server_args,))
     p.start()
 
     if getattr(server_args, "node_rank", 0) != 0:

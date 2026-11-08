@@ -104,11 +104,14 @@ OPTIMIZER_ARGS=(
    --use-precision-aware-optimizer
 )
 
-WANDB_ARGS=(
-   # --use-wandb
-   --wandb-project "SFT-${TASK_NAME}-${MODEL_NAME}"
-   --wandb-group "${TASK_NAME}-${MODEL_NAME}-sft"
+SWANLAB_ARGS=(
+   --use-swanlab
+   --swanlab-mode "${SWANLAB_MODE:-online}"
+   --swanlab-project "SFT-${TASK_NAME}-${MODEL_NAME}"
+   --swanlab-group "${TASK_NAME}-${MODEL_NAME}-sft"
 )
+if [[ -n "${SWANLAB_KEY:-}" ]]; then SWANLAB_ARGS+=(--swanlab-key "${SWANLAB_KEY}"); fi
+if [[ -n "${SWANLAB_WORKSPACE:-}" ]]; then SWANLAB_ARGS+=(--swanlab-workspace "${SWANLAB_WORKSPACE}"); fi
 
 MISC_ARGS=(
    # default dropout in megatron is 0.1
@@ -166,7 +169,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${CKPT_ARGS[@]} \
    ${SFT_ARGS[@]} \
    ${OPTIMIZER_ARGS[@]} \
-   ${WANDB_ARGS[@]} \
+   ${SWANLAB_ARGS[@]} \
    ${PERF_ARGS[@]} \
    ${EVAL_ARGS[@]} \
    ${MISC_ARGS[@]} \
